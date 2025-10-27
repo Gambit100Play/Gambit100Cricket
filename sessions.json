@@ -1,0 +1,37 @@
+{
+  "sessions": [
+    {
+      "id": "5171349113:5171349113",
+      "data": {
+        "betFlow": {
+          "matchId": "134958",
+          "matchName": "Bangladesh vs West Indies",
+          "betType": "PreMatch",
+          "betOption": "Team A to Win",
+          "startedAt": 1761567244396,
+          "completed": true
+        },
+        "waitingForWallet": false
+      }
+    },
+    {
+      "id": "7732895912:7732895912",
+      "data": {
+        "betFlow": {
+          "matchId": "131394",
+          "matchName": "Perth Scorchers Women vs Melbourne Stars Women",
+          "betType": "PreMatch",
+          "betOption": "Team B to Win",
+          "startedAt": 1761505603913,
+          "completed": false
+        }
+      }
+    },
+    {
+      "id": "8368306698:8368306698",
+      "data": {
+        "betFlow": null
+      }
+    }
+  ]
+}

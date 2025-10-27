@@ -1,0 +1,31 @@
+{
+  "name": "cricpredict-bot",
+  "version": "1.0.0",
+  "description": "Cricket prediction Telegram bot",
+  "type": "module",
+  "main": "src/bot/bot.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "author": "Artham",
+  "license": "ISC",
+  "dependencies": {
+    "@noble/secp256k1": "^3.0.0",
+    "axios": "^1.7.0",
+    "bip32": "^5.0.0",
+    "bip39": "^3.1.0",
+    "dotenv": "^16.6.1",
+    "luxon": "^3.7.2",
+    "node-cron": "^4.2.1",
+    "pg": "^8.11.5",
+    "redis": "^5.8.3",
+    "telegraf": "^4.15.0",
+    "telegraf-session-local": "^2.1.1",
+    "tiny-secp256k1": "^2.2.4",
+    "tronweb": "^5.3.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
