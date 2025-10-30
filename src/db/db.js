@@ -129,51 +129,179 @@ export async function getTotalUsers() {
 // =====================================================
 // 🏏 MATCHES
 // =====================================================
+// =====================================================
+// 💾 BULK SAVE MULTIPLE MATCHES FROM CRICBUZZ (Optimized)
+// =====================================================
+// =====================================================
+// 💾 BULK SAVE MULTIPLE MATCHES (Trust precomputed local times)
+// =====================================================
+export async function saveMatches(matches = []) {
+  if (!matches || matches.length === 0) {
+    console.log("⚠️ [DB] No matches provided to saveMatches().");
+    return 0;
+  }
 
+  const client = await pool.connect();
+  let saved = 0;
+
+  try {
+    await client.query("BEGIN");
+
+    for (const match of matches) {
+      try {
+        // ✅ Step 1: Use India-local values provided by API layer directly
+        let startDate = match.start_date || null;
+        let startTimeLocal = match.start_time_local || null;
+
+        // Fallback (rare case): derive if API didn’t send them
+        if (!startDate && match.start_time) {
+          const dt = DateTime.fromISO(match.start_time, { zone: "UTC" }).setZone("Asia/Kolkata");
+          startDate = dt.toFormat("yyyy-LL-dd");
+          startTimeLocal = dt.toFormat("HH:mm:ss");
+        }
+
+        // ✅ Step 2: Skip very old matches (>6h)
+        if (match.start_time) {
+          const matchTime = DateTime.fromISO(match.start_time, { zone: "UTC" }).setZone("Asia/Kolkata");
+          const now = DateTime.now().setZone("Asia/Kolkata");
+          const hoursDiff = now.diff(matchTime, "hours").hours;
+          if (hoursDiff > 6 && match.status !== "live") {
+            console.log(`⏭️ [Skip] Old match (>6h): ${match.name}`);
+            continue;
+          }
+        }
+
+        // ✅ Step 3: Save directly
+        await client.query(
+          `INSERT INTO matches (
+              id, name, start_time, start_date, start_time_local,
+              status, score, api_payload, updated_at
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+           ON CONFLICT (id) DO UPDATE
+             SET name = EXCLUDED.name,
+                 start_time = EXCLUDED.start_time,
+                 start_date = EXCLUDED.start_date,
+                 start_time_local = EXCLUDED.start_time_local,
+                 status = EXCLUDED.status,
+                 score = EXCLUDED.score,
+                 api_payload = EXCLUDED.api_payload,
+                 updated_at = NOW()`,
+          [
+            match.id,
+            match.name,
+            match.start_time,          // already UTC ISO from cricbuzzApi.js
+            startDate,                 // precomputed India date
+            startTimeLocal,            // precomputed India time
+            match.status,
+            match.score || null,
+            match.api_payload ? JSON.stringify(match.api_payload) : null,
+          ]
+        );
+
+        saved++;
+        console.log(`💾 [DB] Saved: ${match.name} (${match.status}) [${startDate} ${startTimeLocal} IST]`);
+      } catch (innerErr) {
+        console.warn(`⚠️ [DB] Skipped ${match.name}: ${innerErr.message}`);
+      }
+    }
+
+    await client.query("COMMIT");
+    console.log(`💾 [DB] Bulk saved ${saved}/${matches.length} matches successfully.`);
+    return saved;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ [DB] saveMatches() transaction failed:", err.message);
+    return 0;
+  } finally {
+    client.release();
+  }
+}
+
+
+// Lock pool + store hash + txid
+export async function lockMatchPool(matchId, hash, txid) {
+  try {
+    await query(
+      `UPDATE pools
+       SET status = 'locked',
+           lock_hash = $1,
+           tron_txid = $2,
+           locked_at = NOW(),
+           updated_at = NOW()
+       WHERE matchid = $3`,
+      [hash, txid, matchId]
+    );
+    console.log(`✅ [DB] Pool locked for match ${matchId}`);
+  } catch (err) {
+    console.error(`❌ [DB] lockMatchPool failed for ${matchId}:`, err.message);
+  }
+}
+
+// Fetch matches still in pre-match phase
+export async function getPendingPrematchMatches() {
+  return query(
+    "SELECT * FROM matches WHERE status = 'PRE_MATCH' AND pool_locked = false"
+  );
+}
 
 export async function saveMatch(match) {
   try {
-    // ✅ Convert UTC to IST (Asia/Kolkata)
     let startDate = null;
     let startTimeLocal = null;
 
     if (match.start_time) {
-      const dtUTC = DateTime.fromISO(match.start_time, { zone: "utc" });
-      const dtIST = dtUTC.setZone("Asia/Kolkata");
+      // ✅ Step 1: Normalize format for Luxon
+      const clean = match.start_time.replace(" ", "T");
 
-      startDate = dtIST.toFormat("yyyy-LL-dd");
-      startTimeLocal = dtIST.toFormat("HH:mm:ss");
+      // ✅ Step 2: Parse with embedded regional offset
+      const dtWithOffset = DateTime.fromISO(clean, { setZone: true });
+
+      // ✅ Step 3: Convert to India Standard Time (Asia/Kolkata)
+      const dtIST = dtWithOffset.setZone("Asia/Kolkata");
+
+      // ✅ Step 4: Format date + time strings
+      startDate = dtIST.toFormat("yyyy-LL-dd"); // e.g. 2025-10-28
+      startTimeLocal = dtIST.toFormat("HH:mm"); // e.g. 10:30
+
+      console.log(
+        `🕓 [TimeConvert] ${match.name}: ${match.start_time} → ${startDate} ${startTimeLocal} IST`
+      );
     }
 
-    // Skip matches older than 6 hours
+    // 🧹 Step 5: Skip saving expired matches (older than 6 h)
     if (startDate && startTimeLocal) {
-      const matchTime = DateTime.fromISO(match.start_time, { zone: "utc" });
-      const nowUTC = DateTime.utc();
-      const hoursDiff = nowUTC.diff(matchTime, "hours").hours;
+      const matchTime = DateTime.fromISO(match.start_time.replace(" ", "T"), { setZone: true });
+      const now = DateTime.now().setZone("Asia/Kolkata");
+      const hoursDiff = now.diff(matchTime.setZone("Asia/Kolkata"), "hours").hours;
       if (hoursDiff > 6) {
         console.log(`⛔ [DB] Skipping save for expired match: ${match.name}`);
         return;
       }
     }
 
+    // 💾 Step 6: Upsert match record
     await pool.query(
-      `INSERT INTO matches (id, name, start_time, start_date, start_time_local, status, score, api_payload, updated_at)
+      `INSERT INTO matches (
+          id, name, start_time, start_date, start_time_local,
+          status, score, api_payload, updated_at
+       )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
        ON CONFLICT (id) DO UPDATE
-       SET name = EXCLUDED.name,
-           start_time = EXCLUDED.start_time,
-           start_date = EXCLUDED.start_date,
-           start_time_local = EXCLUDED.start_time_local,
-           status = EXCLUDED.status,
-           score = EXCLUDED.score,
-           api_payload = EXCLUDED.api_payload,
-           updated_at = NOW()`,
+         SET name = EXCLUDED.name,
+             start_time = EXCLUDED.start_time,
+             start_date = EXCLUDED.start_date,
+             start_time_local = EXCLUDED.start_time_local,
+             status = EXCLUDED.status,
+             score = EXCLUDED.score,
+             api_payload = EXCLUDED.api_payload,
+             updated_at = NOW()`,
       [
         match.id,
         match.name,
-        match.start_time,      // original UTC
-        startDate,             // IST date
-        startTimeLocal,        // IST time
+        match.start_time,  // original string (with offset)
+        startDate,         // India date
+        startTimeLocal,    // India local time
         match.status,
         match.score,
         match.api_payload,
@@ -187,6 +315,8 @@ export async function saveMatch(match) {
     console.error(`❌ [DB] Save failed for ${match.name}:`, err.message);
   }
 }
+
+
 
 
 export async function getMatches() {
@@ -436,6 +566,65 @@ export async function getPastActiveMatches() {
     console.error("❌ [DB] Failed to fetch past active matches:", err.message);
     return [];
   }
+}
+
+// Get all live matches (status = 'LIVE')
+export async function getLiveMatches() {
+  const res = await query("SELECT * FROM matches WHERE status = 'live'");
+  return res.rows;
+}
+// Store a snapshot in live_scores
+export async function insertLiveScoreSnapshot(data) {
+  return query(
+    `INSERT INTO live_scores 
+     (match_id, over_number, ball_number, runs, wickets, total_score, source, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+    [
+      data.match_id,
+      data.over_number,
+      data.ball_number,
+      data.runs,
+      data.wickets,
+      data.total_score,
+      JSON.stringify(data.source),
+    ]
+  );
+}
+
+// Update summary text in matches table
+export async function updateMatchSummary(matchId, summary) {
+  return query(
+    `UPDATE matches 
+     SET score = $1, updated_at = NOW()
+     WHERE id = $2`,
+    [summary, matchId]
+  );
+}
+
+// Update live match score
+export async function updateMatchScore(matchId, data) {
+  return query(
+    `UPDATE matches 
+     SET score = $1,
+         wickets = $2,
+         overs = $3,
+         crr = $4,
+         striker = $5,
+         non_striker = $6,
+         bowler = $7,
+         updated_at = NOW()
+     WHERE id = $8`,
+    [
+      data.runs,
+      data.wickets,
+      data.overs,
+      data.crr,
+      data.striker,
+      data.nonStriker,
+      data.bowler,
+      matchId,
+    ]
+  );
 }
 
 

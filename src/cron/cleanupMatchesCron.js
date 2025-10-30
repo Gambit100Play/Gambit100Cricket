@@ -1,7 +1,7 @@
 // src/cron/cleanupMatchesCron.js
 import cron from "node-cron";
 import { markOldMatchesCompleted, markPastDateMatchesCompleted } from "../db/db.js";
-// import { fetchMatches } from "./fetchMatchesCron.js";
+import { fetchMatches } from "./fetchMatchesCron.js";
 
 function stamp(...args) {
   console.log(
@@ -46,7 +46,7 @@ export async function runUpdate() {
 // ======================================================
 // 🕒 Schedule → 6 AM & 6 PM IST daily
 // ======================================================
-cron.schedule("* */15 * * *", runUpdate, { timezone: "Asia/Kolkata" });
+cron.schedule("* * * * *", runUpdate, { timezone: "Asia/Kolkata" });
 
 // Optional manual trigger for local testing
 // runUpdate();

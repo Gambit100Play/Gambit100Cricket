@@ -32,3 +32,16 @@ import { publishHashMemo } from "../utils/tronPublisher.js"; // ✅ correct impo
     console.error("Reason:", err.message);
   }
 })();
+
+// ✅ Wrapper for testing / generic memo publishing
+export async function publishHashMemo(hash, label = "PoolLock") {
+  const txid = await publishHashToTron(hash);
+  if (!txid) throw new Error("TRON transaction failed");
+
+  return {
+    label,
+    memo: hash,
+    txid,
+    explorer: `https://shasta.tronscan.org/#/transaction/${txid}`,
+  };
+}

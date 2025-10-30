@@ -23,7 +23,7 @@
     "telegraf": "^4.15.0",
     "telegraf-session-local": "^2.1.1",
     "tiny-secp256k1": "^2.2.4",
-    "tronweb": "^5.3.2"
+    "tronweb": "^6.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

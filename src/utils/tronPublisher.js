@@ -1,149 +1,159 @@
-import pkg from "tronweb";
-const { TronWeb } = pkg;
+// src/utils/tronPublisher.js
+// ✅ Correct import for tronweb@6.x (Node 20+ ESM)
+import * as TronWebModule from "tronweb";
+import https from "https"; // 🔥 used for manual broadcast
+const { TronWeb } = TronWebModule;
 
 /**
- * ✅ Required environment variables:
- *  - TRON_FULL_NODE  (e.g. https://api.trongrid.io or https://api.shasta.trongrid.io)
- *  - TRON_PRIVATE_KEY
- *  - TRON_SENDER  (base58)
- *  - Optional: TRON_RECEIVER (base58)
+ * 🧾 Publish a hash memo transaction on TRON (with full debug logging)
  */
-
-function checkEnv() {
-  const missing = [];
-  for (const key of ["TRON_FULL_NODE", "TRON_PRIVATE_KEY", "TRON_SENDER"]) {
-    if (!process.env[key]) missing.push(key);
-  }
-  if (missing.length > 0) throw new Error(`🚨 Missing Tron env vars: ${missing.join(", ")}`);
-
-  for (const k of ["TRON_FULL_NODE", "TRON_PRIVATE_KEY", "TRON_SENDER", "TRON_RECEIVER"]) {
-    if (process.env[k])
-      process.env[k] = process.env[k].trim().replace(/^"|"$/g, "").replace(/\uFEFF/g, "");
-  }
-
-  console.log("🔧 ENV CHECK:", {
-    TRON_FULL_NODE: process.env.TRON_FULL_NODE,
-    TRON_SENDER: process.env.TRON_SENDER,
-    TRON_PRIVATE_KEY: `✅ loaded (${process.env.TRON_PRIVATE_KEY.slice(0, 6)}…)`,
-  });
-}
-
-export function tron() {
-  checkEnv();
-  const node = process.env.TRON_FULL_NODE;
-  return new TronWeb({
-    fullNode: node,
-    solidityNode: node,
-    eventServer: node,
-    privateKey: process.env.TRON_PRIVATE_KEY,
-  });
-}
-
-/**
- * 🔒 Publish a hash as memo (Tx.data)
- * Attaches <label>:<hash> to a 1 Sun transfer
- */
-export async function publishHashMemo(hashHex, label = "PoolLock") {
-  checkEnv();
-  const tw = tron();
-
-  const from = process.env.TRON_SENDER;
-  const to =
-    process.env.TRON_RECEIVER && process.env.TRON_RECEIVER !== from
-      ? process.env.TRON_RECEIVER
-      : from; // ✅ self-transfer if no receiver
-
-  console.log(`🔐 Attempting to publish hash: ${hashHex}`);
-
-  // Helper: sign + broadcast
-  const signAndBroadcast = async (tx) => {
-    const memo = `${label}:${hashHex}`.slice(0, 190).replace(/[^\x20-\x7E]/g, "?");
-    tx.raw_data.data = Buffer.from(memo, "utf8").toString("base64");
-    if (typeof tx.raw_data.fee_limit !== "number") tx.raw_data.fee_limit = 10_000_000;
-
-    const signed = await tw.trx.sign(tx);
-    console.log("🖋️ [TronTx] Transaction signed successfully");
-
-    const receipt = await tw.trx.sendRawTransaction(signed);
-    if (!receipt?.result) {
-      console.error("❌ [TronTx] Broadcast failed:", receipt);
-      throw new Error(`Broadcast failed: ${JSON.stringify(receipt)}`);
-    }
-
-    const txid = signed.txID || receipt.txid;
-    const explorerBase =
-      process.env.TRON_FULL_NODE.includes("shasta") || process.env.NETWORK === "shasta"
-        ? "https://shasta.tronscan.org/#/transaction"
-        : "https://tronscan.org/#/transaction";
-    const explorer = `${explorerBase}/${txid}`;
-
-    console.log("✅ [TronTx] Hash published successfully!");
-    console.log(`   🧩 Memo: ${memo}`);
-    console.log(`   🔗 Explorer: ${explorer}`);
-
-    return { txid, memo, explorer };
-  };
-
+export async function publishHashToTron(hash) {
   try {
-    // ✅ Balance check
-    const balance = await tw.trx.getBalance(from);
-    console.log(`💰 [Balance] Wallet ${from} = ${balance} Sun`);
-    if (balance < 100000) throw new Error("Insufficient TRX (need ≥ 0.1 TRX)");
+    if (!hash) throw new Error("No hash provided");
 
-    // ✅ Validate addresses
-    if (!tw.isAddress(from)) throw new Error(`Invalid sender address: ${from}`);
-    if (!tw.isAddress(to)) throw new Error(`Invalid receiver address: ${to}`);
+    // ────────────── ENV CLEANUP ──────────────
+    const sender = process.env.TRON_SENDER?.trim();
+    const receiver = process.env.TRON_RECEIVER?.trim();
+    const pk = process.env.TRON_PRIVATE_KEY?.trim();
+    const fullNode =
+      process.env.TRON_FULL_NODE?.trim() || "https://api.shasta.trongrid.io";
+    const apiKey = process.env.TRONGRID_API_KEY?.trim();
 
-    // ✅ Preferred path: builder
-    try {
-      const tx = await tw.transactionBuilder.sendTrx(to, 1, from); // 1 Sun
-      if (!tx.raw_data.expiration) tx.raw_data.expiration = Date.now() + 10 * 60 * 1000;
-      if (!tx.raw_data.timestamp) tx.raw_data.timestamp = Date.now();
-      return await signAndBroadcast(tx);
-    } catch (builderErr) {
-      console.warn("⚠️ Builder path failed, trying manual build:", builderErr.message);
+    if (!sender || !receiver || !pk)
+      throw new Error("Missing TRON_SENDER, TRON_RECEIVER, or TRON_PRIVATE_KEY");
+
+    // ────────────── INIT TRONWEB ──────────────
+    const tronWeb = new TronWeb({
+      fullHost: fullNode,
+      headers: { "TRON-PRO-API-KEY": apiKey },
+      privateKey: pk,
+    });
+
+    // ────────────── DERIVED ADDRESS & BALANCE CHECK ──────────────
+    const derived = tronWeb.address.fromPrivateKey(pk);
+    const balance = await tronWeb.trx.getBalance(sender);
+
+    console.log("🔧 [TRON DEBUG: ENV & STATE]", {
+      node: fullNode,
+      sender,
+      derived,
+      receiver,
+      apiKeyPresent: Boolean(apiKey),
+      hash,
+      balanceSUN: balance,
+      balanceTRX: balance / 1_000_000,
+    });
+
+    if (derived !== sender) {
+      throw new Error(
+        `❌ Private key does not match TRON_SENDER. Derived=${derived}, Sender=${sender}`
+      );
     }
 
-    // ✅ Fallback: manual build
-    const latestBlock = await tw.trx.getCurrentBlock();
-    const blockNumber = latestBlock.block_header.raw_data.number;
-    const blockHash = latestBlock.blockID;
+    if (balance <= 0) {
+      throw new Error(
+        `❌ Sender balance is 0 TRX. Please fund via Shasta faucet before retrying.`
+      );
+    }
 
-   // --- address conversions (TronWeb auto-detects Base58) ---
-const ownerHex = tw.address.toHex(from);
-const toHex = tw.address.toHex(to);
+    console.log(`🚀 [TRON] Building TX from ${sender} → ${receiver}`);
 
+    // ────────────── TX CREATION ──────────────
+    let tx = await tronWeb.transactionBuilder.sendTrx(
+      receiver,
+      1_000_000, // 1 TRX
+      sender
+    );
+    tx.visible = true; // ensure base58 serialization
 
-    const refBlockBytes = blockNumber.toString(16).slice(-4).padStart(4, "0");
-    const refBlockHash = blockHash.substring(16, 24);
+    console.log("📦 [TX RAW CREATED]", tx);
 
-    const manualTx = {
-      visible: false,
-      raw_data: {
-        contract: [
-          {
-            parameter: {
-              value: {
-                amount: 1,
-                owner_address: ownerHex,
-                to_address: toHex,
-              },
-              type_url: "type.googleapis.com/protocol.TransferContract",
-            },
-            type: "TransferContract",
-          },
-        ],
-        ref_block_bytes: refBlockBytes,
-        ref_block_hash: refBlockHash,
-        expiration: Date.now() + 10 * 60 * 1000,
-        timestamp: Date.now(),
-        fee_limit: 10_000_000,
-      },
-    };
+    // ────────────── Attach memo ──────────────
+    const memoHex = tronWeb.toHex(hash).replace(/^0x/, "");
+    tx.raw_data.data = memoHex;
 
-    return await signAndBroadcast(manualTx);
+    console.log("🧾 [TX AFTER MEMO ATTACH]", {
+      dataHex: memoHex,
+      rawData: tx.raw_data,
+      visibleFlag: tx.visible,
+    });
+
+    // ────────────── SIGN (RAW DER MODE for Shasta) ──────────────
+    console.log("✍️ [SIGNING TX - Raw DER Mode for Shasta] ...");
+
+    // Step 1: Compute TX hash
+    const txHash = await tronWeb.trx.getTransactionHash(tx);
+
+    // Step 2: Sign raw hex hash using private key (DER-encoded)
+    const signedHex = tronWeb.utils.crypto.signHex(txHash, pk);
+
+    // Step 3: Attach signature manually
+    tx.signature = [signedHex];
+    tx.txID = txHash; // ensure txID field present
+
+    console.log("✍️ [SIGNED TX]", {
+      txID: txHash,
+      signature: signedHex,
+      sigLength: signedHex.length,
+    });
+
+    // ────────────── BROADCAST (MANUAL WITH API KEY) ──────────────
+    console.log("📤 [TRON] Broadcasting transaction manually with API key...");
+
+    const receipt = await new Promise((resolve, reject) => {
+      const data = JSON.stringify(tx);
+      const url = new URL(`${fullNode}/wallet/broadcasttransaction`);
+
+      const options = {
+        hostname: url.hostname,
+        path: url.pathname,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "TRON-PRO-API-KEY": apiKey,
+        },
+      };
+
+      const req = https.request(options, (res) => {
+        let responseData = "";
+        res.on("data", (chunk) => (responseData += chunk));
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(responseData);
+            resolve(json);
+          } catch {
+            reject(new Error("Failed to parse node response"));
+          }
+        });
+      });
+
+      req.on("error", (err) => reject(err));
+      req.write(data);
+      req.end();
+    });
+
+    console.log("📡 [TRON RECEIPT]", receipt);
+
+    if (!receipt?.result)
+      throw new Error(`❌ Broadcast rejected: ${JSON.stringify(receipt)}`);
+
+    const txid = receipt.txid || tx.txID;
+    console.log(`✅ [TRON] Broadcasted TX: ${txid}`);
+
+    // ────────────── CONFIRMATION WAIT ──────────────
+    for (let i = 0; i < 15; i++) {
+      const info = await tronWeb.trx.getTransactionInfo(txid);
+      if (info?.receipt?.result === "SUCCESS") {
+        console.log("✅ [TRON] Confirmed on-chain (Shasta)");
+        return txid;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    console.warn("⚠️ [TRON] Broadcasted but not yet confirmed");
+    return txid;
   } catch (err) {
-    console.error(`❌ [TronTx] Error: ${err.message}`);
-    throw new Error(`Failed to publish Tron memo: ${err.message}`);
+    console.error("🚨 TRON publish failed:", err.message || err);
+    return null;
   }
 }

@@ -1,14 +1,17 @@
-// src/bot/handlers/checkBalanceHandler.js
+// ────────────────────────────────────────────────
+// 🌐 TronWeb ESM-safe Import (Node v22+ Compatible)
+// ────────────────────────────────────────────────
 import TronWebModule from "tronweb";
-const TronWeb = TronWebModule.default || TronWebModule;
 import dotenv from "dotenv";
 import { getUserWallet, getUserBalance } from "../../db/db.js";
 
 dotenv.config();
 
+// Handle ESM + CJS compatibility for TronWeb
+const TronWeb = TronWebModule.TronWeb || TronWebModule.default || TronWebModule;
 
 // ────────────────────────────────────────────────
-// 🌐 Select Mainnet or Shasta
+// 🌍 Network Configuration
 // ────────────────────────────────────────────────
 const NETWORK = process.env.NETWORK || "mainnet";
 const IS_SHASTA = NETWORK.toLowerCase() === "shasta";
@@ -18,16 +21,16 @@ const tronWeb = new TronWeb({
     ? "https://api.shasta.trongrid.io"
     : "https://api.trongrid.io",
   headers: { "TRON-PRO-API-KEY": process.env.TRONGRID_API_KEY },
+  privateKey: process.env.TRON_PRIVATE_KEY || "", // optional
 });
 
 export default function checkBalanceHandler(bot) {
-  // 💰 Handle "Check Balance" button
   bot.action("show_balance", async (ctx) => {
     await ctx.answerCbQuery("Fetching balance...");
     const telegramId = ctx.from.id;
 
     try {
-      // 1️⃣ Fetch user wallet from DB
+      // 1️⃣ Fetch user's deposit address
       const userWallet = await getUserWallet(telegramId);
       if (!userWallet?.deposit_address) {
         return ctx.reply(
@@ -45,7 +48,7 @@ export default function checkBalanceHandler(bot) {
       try {
         const usdtContract =
           process.env.USDT_CONTRACT_ADDRESS ||
-          "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"; // mainnet USDT
+          "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"; // mainnet
         const contract = await tronWeb.contract().at(usdtContract);
         const bal = await contract.balanceOf(depositAddress).call();
         usdtBalance = Number(tronWeb.fromSun(bal));
@@ -56,7 +59,7 @@ export default function checkBalanceHandler(bot) {
       // 3️⃣ Fetch G-Token balance from DB
       const tokenBal = await getUserBalance(telegramId);
 
-      // 4️⃣ Format & send reply
+      // 4️⃣ Build final message
       const message =
         `💼 *CricPredict Wallet Summary*\n\n` +
         `📥 *Deposit Address:*\n\`${depositAddress}\`\n\n` +
