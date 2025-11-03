@@ -1,159 +1,67 @@
-// src/utils/tronPublisher.js
-// ✅ Correct import for tronweb@6.x (Node 20+ ESM)
 import * as TronWebModule from "tronweb";
-import https from "https"; // 🔥 used for manual broadcast
 const { TronWeb } = TronWebModule;
 
 /**
- * 🧾 Publish a hash memo transaction on TRON (with full debug logging)
+ * ✅ Publish hash as memo transaction on TRON Shasta testnet
  */
 export async function publishHashToTron(hash) {
   try {
-    if (!hash) throw new Error("No hash provided");
+    const fullNode = process.env.TRON_FULL_NODE;
+    const privateKey = process.env.TRON_PRIVATE_KEY;
+    const sender = process.env.TRON_SENDER;
+    const receiver = process.env.TRON_RECEIVER;
+    const apiKey = process.env.TRONGRID_API_KEY;
 
-    // ────────────── ENV CLEANUP ──────────────
-    const sender = process.env.TRON_SENDER?.trim();
-    const receiver = process.env.TRON_RECEIVER?.trim();
-    const pk = process.env.TRON_PRIVATE_KEY?.trim();
-    const fullNode =
-      process.env.TRON_FULL_NODE?.trim() || "https://api.shasta.trongrid.io";
-    const apiKey = process.env.TRONGRID_API_KEY?.trim();
-
-    if (!sender || !receiver || !pk)
-      throw new Error("Missing TRON_SENDER, TRON_RECEIVER, or TRON_PRIVATE_KEY");
-
-    // ────────────── INIT TRONWEB ──────────────
     const tronWeb = new TronWeb({
       fullHost: fullNode,
       headers: { "TRON-PRO-API-KEY": apiKey },
-      privateKey: pk,
+      privateKey,
     });
 
-    // ────────────── DERIVED ADDRESS & BALANCE CHECK ──────────────
-    const derived = tronWeb.address.fromPrivateKey(pk);
-    const balance = await tronWeb.trx.getBalance(sender);
-
+    // 🔍 Debug
+    const balanceSun = await tronWeb.trx.getBalance(sender);
     console.log("🔧 [TRON DEBUG: ENV & STATE]", {
       node: fullNode,
       sender,
-      derived,
       receiver,
-      apiKeyPresent: Boolean(apiKey),
+      apiKeyPresent: !!apiKey,
       hash,
-      balanceSUN: balance,
-      balanceTRX: balance / 1_000_000,
+      balanceSUN: balanceSun,
+      balanceTRX: balanceSun / 1e6,
     });
 
-    if (derived !== sender) {
-      throw new Error(
-        `❌ Private key does not match TRON_SENDER. Derived=${derived}, Sender=${sender}`
-      );
-    }
-
-    if (balance <= 0) {
-      throw new Error(
-        `❌ Sender balance is 0 TRX. Please fund via Shasta faucet before retrying.`
-      );
-    }
-
+    // 🏗️ Step 1: Create TX (1 SUN = minimum)
     console.log(`🚀 [TRON] Building TX from ${sender} → ${receiver}`);
+    const baseTx = await tronWeb.transactionBuilder.sendTrx(receiver, 1, sender);
 
-    // ────────────── TX CREATION ──────────────
-    let tx = await tronWeb.transactionBuilder.sendTrx(
-      receiver,
-      1_000_000, // 1 TRX
-      sender
+    // 🧾 Step 2: Attach Memo safely (no hex conversion)
+    const txWithMemo = await tronWeb.transactionBuilder.addUpdateData(
+      baseTx,
+      hash, // plain text memo
+      "utf8"
     );
-    tx.visible = true; // ensure base58 serialization
 
-    console.log("📦 [TX RAW CREATED]", tx);
+    // ✍️ Step 3: Sign TX
+    console.log("✍️ [SIGNING TX - Shasta Mode] ...");
+    const signedTx = await tronWeb.trx.sign(txWithMemo, privateKey);
+    if (!signedTx) throw new Error("Transaction signing failed");
 
-    // ────────────── Attach memo ──────────────
-    const memoHex = tronWeb.toHex(hash).replace(/^0x/, "");
-    tx.raw_data.data = memoHex;
+    // ✅ Step 4: Extract txID
+    const txHash = signedTx.txID || signedTx.transaction?.txID || null;
 
-    console.log("🧾 [TX AFTER MEMO ATTACH]", {
-      dataHex: memoHex,
-      rawData: tx.raw_data,
-      visibleFlag: tx.visible,
-    });
+    // 🚀 Step 5: Broadcast
+    console.log("🚀 [BROADCASTING TX]");
+    const broadcast = await tronWeb.trx.sendRawTransaction(signedTx);
 
-    // ────────────── SIGN (RAW DER MODE for Shasta) ──────────────
-    console.log("✍️ [SIGNING TX - Raw DER Mode for Shasta] ...");
-
-    // Step 1: Compute TX hash
-    const txHash = await tronWeb.trx.getTransactionHash(tx);
-
-    // Step 2: Sign raw hex hash using private key (DER-encoded)
-    const signedHex = tronWeb.utils.crypto.signHex(txHash, pk);
-
-    // Step 3: Attach signature manually
-    tx.signature = [signedHex];
-    tx.txID = txHash; // ensure txID field present
-
-    console.log("✍️ [SIGNED TX]", {
-      txID: txHash,
-      signature: signedHex,
-      sigLength: signedHex.length,
-    });
-
-    // ────────────── BROADCAST (MANUAL WITH API KEY) ──────────────
-    console.log("📤 [TRON] Broadcasting transaction manually with API key...");
-
-    const receipt = await new Promise((resolve, reject) => {
-      const data = JSON.stringify(tx);
-      const url = new URL(`${fullNode}/wallet/broadcasttransaction`);
-
-      const options = {
-        hostname: url.hostname,
-        path: url.pathname,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "TRON-PRO-API-KEY": apiKey,
-        },
-      };
-
-      const req = https.request(options, (res) => {
-        let responseData = "";
-        res.on("data", (chunk) => (responseData += chunk));
-        res.on("end", () => {
-          try {
-            const json = JSON.parse(responseData);
-            resolve(json);
-          } catch {
-            reject(new Error("Failed to parse node response"));
-          }
-        });
-      });
-
-      req.on("error", (err) => reject(err));
-      req.write(data);
-      req.end();
-    });
-
-    console.log("📡 [TRON RECEIPT]", receipt);
-
-    if (!receipt?.result)
-      throw new Error(`❌ Broadcast rejected: ${JSON.stringify(receipt)}`);
-
-    const txid = receipt.txid || tx.txID;
-    console.log(`✅ [TRON] Broadcasted TX: ${txid}`);
-
-    // ────────────── CONFIRMATION WAIT ──────────────
-    for (let i = 0; i < 15; i++) {
-      const info = await tronWeb.trx.getTransactionInfo(txid);
-      if (info?.receipt?.result === "SUCCESS") {
-        console.log("✅ [TRON] Confirmed on-chain (Shasta)");
-        return txid;
-      }
-      await new Promise((r) => setTimeout(r, 1000));
+    if (broadcast.result) {
+      console.log(`🔗 Published to TRON! ✅ TX ID: ${txHash}`);
+    } else {
+      console.error("🚨 Broadcast failed:", broadcast);
     }
 
-    console.warn("⚠️ [TRON] Broadcasted but not yet confirmed");
-    return txid;
+    return txHash || "UNKNOWN_TXID";
   } catch (err) {
-    console.error("🚨 TRON publish failed:", err.message || err);
+    console.error("🚨 TRON publish failed:", err.message);
     return null;
   }
 }

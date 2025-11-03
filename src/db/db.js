@@ -9,13 +9,14 @@ const { Pool } = pkg;
 // =====================================================
 // 🔑 Database Connection Pool
 // =====================================================
-const pool = new Pool({
+export const pool = new Pool({
   user: process.env.PGUSER,
   host: process.env.PGHOST,
   database: process.env.PGDATABASE,
   password: process.env.PGPASSWORD,
   port: process.env.PGPORT,
 });
+console.log("Connected to PostgreSQL");
 
 // =====================================================
 // 🧩 Generic Query Helper
@@ -78,26 +79,29 @@ export async function updateUserActivity(telegramId) {
 // =====================================================
 // 💼 WALLET MANAGEMENT (Deposit + Withdrawal)
 // =====================================================
-export async function saveUserWallet(telegramId, { withdrawal_address, deposit_address }) {
+export async function saveUserWallet(telegramId, { network = "TRON", deposit_address, withdrawal_address = null }) {
   await pool.query(
-    `INSERT INTO users (telegram_id, withdrawal_address, deposit_address, last_active)
-     VALUES ($1, $2, $3, NOW())
-     ON CONFLICT (telegram_id)
+    `INSERT INTO user_wallets (telegram_id, network, deposit_address, last_balance_trx, last_balance_usdt, created_at)
+     VALUES ($1, $2, $3, 0, 0, NOW())
+     ON CONFLICT (telegram_id, network)
      DO UPDATE SET
-       withdrawal_address = $2,
-       deposit_address = $3,
-       last_active = NOW()`,
-    [telegramId, withdrawal_address, deposit_address]
+       deposit_address = EXCLUDED.deposit_address,
+       updated_at = NOW()`,
+    [telegramId, network, deposit_address]
   );
+  console.log(`💾 [DB] Wallet record saved for user ${telegramId} (${network})`);
 }
 
-export async function getUserWallet(telegramId) {
+export async function getUserWallet(telegramId, network = "TRON") {
   const res = await pool.query(
-    `SELECT withdrawal_address, deposit_address FROM users WHERE telegram_id = $1`,
-    [telegramId]
+    `SELECT deposit_address, last_balance_trx, last_balance_usdt
+       FROM user_wallets
+      WHERE telegram_id = $1 AND network = $2`,
+    [telegramId, network]
   );
   return res.rows[0] || {};
 }
+
 
 // =====================================================
 // 💰 BALANCES
@@ -343,6 +347,9 @@ export async function getMatchById(matchId) {
 // =====================================================
 // 🎲 BETS
 // =====================================================
+// =====================================================
+// 🎲 BETS (with automatic pool management)
+// =====================================================
 export async function placeBetWithDebit({
   telegramId,
   matchId,
@@ -357,6 +364,7 @@ export async function placeBetWithDebit({
   try {
     await client.query("BEGIN");
 
+    // 1️⃣ Lock user balance for update
     const balRes = await client.query(
       `SELECT tokens, bonus_tokens, usdt
          FROM balances
@@ -364,6 +372,7 @@ export async function placeBetWithDebit({
         FOR UPDATE`,
       [telegramId]
     );
+
     if (balRes.rowCount === 0) throw new Error("Balance not found for user");
 
     let { tokens, bonus_tokens: bonus, usdt } = balRes.rows[0];
@@ -372,6 +381,7 @@ export async function placeBetWithDebit({
 
     if (stake > tokens + bonus) throw new Error("INSUFFICIENT_FUNDS");
 
+    // 2️⃣ Deduct stake (use bonus first)
     let remaining = stake;
     const useBonus = Math.min(bonus, remaining);
     bonus -= useBonus;
@@ -385,34 +395,54 @@ export async function placeBetWithDebit({
       [telegramId, tokens, bonus]
     );
 
+    // 3️⃣ Record the bet
     const betRes = await client.query(
-  `INSERT INTO bets
-     (telegram_id, match_id, match_name, bet_type, bet_option, stake, 
-      status, created_at, market_type, segment_duration)
-   VALUES ($1, $2, $3, $4, $5, $6, 'Pending', NOW(), INITCAP($7), $8)
-   RETURNING *`,
-  [
-    telegramId,
-    matchId,
-    matchName,
-    betType,
-    betOption,
-    stake,
-    marketType,
-    segmentDuration,
-  ]
+      `INSERT INTO bets
+         (telegram_id, match_id, match_name, bet_type, bet_option, stake,
+          status, created_at, market_type, segment_duration)
+       VALUES ($1, $2, $3, $4, $5, $6, 'Pending', NOW(), INITCAP($7), $8)
+       RETURNING *`,
+      [
+        telegramId,
+        matchId,
+        matchName,
+        betType,
+        betOption,
+        stake,
+        marketType,
+        segmentDuration,
+      ]
+    );
+
+    // 4️⃣ 🔧 Auto-create or update pool summary
+    // 🧩 Ensure a pool record exists for this match + pool_type
+await client.query(
+  `INSERT INTO pools (matchid, pool_type, status, total_stake, created_at, updated_at)
+   VALUES ($1, INITCAP($2), 'active', $3, NOW(), NOW())
+   ON CONFLICT (matchid, pool_type)
+   DO UPDATE
+     SET total_stake = pools.total_stake + $3,
+         updated_at = NOW()`,
+  [matchId, marketType, stake]
 );
 
 
+    // 5️⃣ Commit transaction
     await client.query("COMMIT");
+
+    console.log(
+      `🎯 [DB] Bet placed: ${telegramId} → ${matchName} (${betOption}, ${stake} G)`
+    );
     return { bet: betRes.rows[0], balance: { tokens, bonus, usdt } };
   } catch (err) {
     await client.query("ROLLBACK");
+    console.error(`❌ [DB] placeBetWithDebit failed:`, err.message);
     throw err;
   } finally {
     client.release();
   }
 }
+
 
 
 // =====================================================
@@ -445,41 +475,206 @@ export async function getPoolSummary(matchId, marketType = "PreMatch") {
   }
 }
 
+// =====================================================
+// ❌ CANCEL USER BET (Transactional)
+// =====================================================
+export async function cancelUserBet(telegramId, playIndex) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    console.log(`🧾 [DB] Starting cancelUserBet for user=${telegramId} | index=${playIndex}`);
 
+    // 1️⃣ Fetch all bets for this user ordered consistently
+    const { rows: bets } = await client.query(
+      `SELECT id, stake, status 
+         FROM bets 
+        WHERE telegram_id = $1 
+        ORDER BY created_at DESC`,
+      [telegramId]
+    );
+
+    if (!bets.length) {
+      console.warn(`⚠️ [DB] No bets found for ${telegramId}`);
+      await client.query("ROLLBACK");
+      return { success: false, error: "NO_BETS" };
+    }
+
+    const bet = bets[playIndex];
+    if (!bet) {
+      console.warn(`⚠️ [DB] No bet at index ${playIndex} for ${telegramId}`);
+      await client.query("ROLLBACK");
+      return { success: false, error: "INVALID_INDEX" };
+    }
+
+    if (bet.status.toLowerCase() !== "pending") {
+      console.warn(`⚠️ [DB] Bet ${bet.id} is already ${bet.status}`);
+      await client.query("ROLLBACK");
+      return { success: false, error: "NOT_PENDING" };
+    }
+
+    console.log(`🧮 [DB] Found bet ${bet.id} with stake=${bet.stake}`);
+
+    // 2️⃣ Fetch current balance
+    const { rows: balances } = await client.query(
+      `SELECT tokens, bonus_tokens, usdt 
+         FROM balances 
+        WHERE telegram_id = $1 
+        FOR UPDATE`,
+      [telegramId]
+    );
+
+    if (!balances.length) {
+      console.warn(`⚠️ [DB] No balance row found for ${telegramId}`);
+      await client.query("ROLLBACK");
+      return { success: false, error: "NO_BALANCE" };
+    }
+
+    const balance = balances[0];
+    const newTokens = Number(balance.tokens) + Number(bet.stake);
+
+    // 3️⃣ Update balance + bet atomically
+    await client.query(
+      `UPDATE balances
+          SET tokens = $2
+        WHERE telegram_id = $1`,
+      [telegramId, newTokens]
+    );
+
+    const res = await client.query(
+      `UPDATE bets
+          SET status = 'Cancelled',
+              result_data = jsonb_build_object('reason','User cancelled manually'),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [bet.id]
+    );
+
+    if (res.rowCount === 0) {
+      console.warn(`⚠️ [DB] No rows updated for bet ${bet.id}`);
+      await client.query("ROLLBACK");
+      return { success: false, error: "NO_UPDATE" };
+    }
+
+    await client.query("COMMIT");
+
+    console.log(
+      `✅ [DB] Cancelled bet ${bet.id} for ${telegramId} | refunded=${bet.stake} | newTokens=${newTokens}`
+    );
+
+    return {
+      success: true,
+      playId: bet.id,
+      refunded: bet.stake,
+      newBalance: newTokens,
+    };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(`❌ [DB] cancelUserBet failed for ${telegramId}:`, err.message);
+    return { success: false, error: err.message };
+  } finally {
+    client.release();
+  }
+}
+
+// =====================================================
+// ⚖️ DYNAMIC ODDS + POOL SUMMARY (Updated for Real Team Names)
+// =====================================================
 export async function getDynamicOdds(matchId, marketType = "PreMatch") {
   try {
+    // 🔍 Step 1: Fetch pool info
     const poolInfo = await getPoolInfo(matchId, marketType);
     const status = poolInfo.status || getPoolStatus(poolInfo.participants);
 
-    // 💤 Pending pool: show 1.00x odds for all markets
+    // 🎯 Step 2: Fetch team names
+    const matchRes = await pool.query(
+      `SELECT api_payload FROM matches WHERE id = $1 LIMIT 1`,
+      [matchId]
+    );
+
+    let teamA = "Team A";
+    let teamB = "Team B";
+
+    if (matchRes.rowCount > 0) {
+      try {
+        const payload =
+          typeof matchRes.rows[0].api_payload === "object"
+            ? matchRes.rows[0].api_payload
+            : JSON.parse(matchRes.rows[0].api_payload || "{}");
+
+        teamA = payload?.team1?.teamName || teamA;
+        teamB = payload?.team2?.teamName || teamB;
+      } catch (err) {
+        console.warn("⚠️ [DB] getDynamicOdds: Could not parse api_payload:", err.message);
+      }
+    }
+
+    // 💤 Pending pool: static odds
     if (status === "pending") {
       return [
-        { bet_option: "Team A to Win", odds: 1.00, stake_on_option: 0 },
-        { bet_option: "Team B to Win", odds: 1.00, stake_on_option: 0 },
+        { bet_option: `${teamA} to Win`, odds: 1.00, stake_on_option: 0 },
+        { bet_option: `${teamB} to Win`, odds: 1.00, stake_on_option: 0 },
         { bet_option: "Draw / Tie", odds: 1.00, stake_on_option: 0 },
         { bet_option: "Over 300 Runs", odds: 1.00, stake_on_option: 0 },
         { bet_option: "Under 300 Runs", odds: 1.00, stake_on_option: 0 },
       ];
     }
 
-    // ✅ Active pool: calculate dynamic odds based on stake distribution
+    // ✅ Step 3: Active pool odds based on stake distribution
     const totalStake = poolInfo.totalStake || 1;
 
-    return poolInfo.rows.map((r) => {
+    let computed = poolInfo.rows.map((r) => {
       const stake = Number(r.total_stake || 0);
       const share = stake / totalStake;
 
-      // 🧠 Odds formula: (1 / share) * 0.9 (10% margin)
-      const fairOdds = 1 / Math.max(share, 0.05); // avoid div by zero
+      // 🧮 Dynamic odds formula
+      const fairOdds = 1 / Math.max(share, 0.05);
       const adjusted = fairOdds * 0.9;
-      const dynamic = Math.min(Math.max(adjusted, 1.1), 10.0); // clamp between 1.1–10x
+      const dynamic = Math.min(Math.max(adjusted, 1.1), 10.0);
+
+      // Normalize option names
+      let normalizedOption = r.bet_option
+        .replace(/Team A/gi, teamA)
+        .replace(/Team B/gi, teamB)
+        .trim();
 
       return {
-        bet_option: r.bet_option,
+        bet_option: normalizedOption,
         odds: Number(dynamic.toFixed(2)),
         stake_on_option: stake,
       };
     });
+
+    // ✅ Step 4: Remove duplicates — keep the one with higher stake
+    const unique = new Map();
+    for (const opt of computed) {
+      const key = opt.bet_option.toLowerCase();
+      if (!unique.has(key) || opt.stake_on_option > unique.get(key).stake_on_option) {
+        unique.set(key, opt);
+      }
+    }
+    computed = [...unique.values()];
+
+    // ✅ Step 5: Fill missing defaults (if none exist)
+    const defaults = [
+      `${teamA} to Win`,
+      `${teamB} to Win`,
+      "Draw / Tie",
+      "Over 300 Runs",
+      "Under 300 Runs",
+    ];
+    for (const opt of defaults) {
+      const key = opt.toLowerCase();
+      if (!unique.has(key)) {
+        computed.push({ bet_option: opt, odds: 1.00, stake_on_option: 0 });
+      }
+    }
+
+    console.log(
+      `🎯 [DB] Dynamic odds computed for ${matchId}:`,
+      computed.map((c) => `${c.bet_option}=${c.odds}x`).join(", ")
+    );
+
+    return computed;
   } catch (err) {
     console.error("❌ [DB] getDynamicOdds error:", err.message);
     return [
@@ -489,6 +684,22 @@ export async function getDynamicOdds(matchId, marketType = "PreMatch") {
       { bet_option: "Over 300 Runs", odds: 1.00, stake_on_option: 0 },
       { bet_option: "Under 300 Runs", odds: 1.00, stake_on_option: 0 },
     ];
+  }
+}
+
+export async function getBetById(betId) {
+  try {
+    const res = await pool.query(
+      `SELECT id, telegram_id, match_name, bet_option, stake, status
+         FROM bets
+        WHERE id = $1
+        LIMIT 1`,
+      [betId]
+    );
+    return res.rows[0] || null;
+  } catch (err) {
+    console.error(`❌ [DB] getBetById failed for bet ${betId}:`, err.message);
+    return null;
   }
 }
 
@@ -552,14 +763,26 @@ export async function deleteExpiredMatches() {
 // =====================================================
 
 // 🔍 Get matches that started before now but not completed
+// 🔍 Get matches that started before now but are still active
 export async function getPastActiveMatches() {
   try {
     const res = await pool.query(`
-      SELECT *
-      FROM matches
-      WHERE start_time <= NOW()
-        AND LOWER(status) IN ('live', 'upcoming', 'scheduled')
-      ORDER BY start_time DESC;
+      SELECT 
+        m.id AS match_id,
+        m.api_payload->'team1'->>'teamName' AS team_a,
+        m.api_payload->'team2'->>'teamName' AS team_b,
+        m.api_payload->'venueInfo'->>'ground' AS venue,
+        m.api_payload->>'tossStatus' AS toss_info,
+        m.start_time,
+        m.status
+      FROM matches m
+      WHERE 
+        m.start_time <= NOW()
+        -- ✅ Only active states
+        AND LOWER(m.status) IN ('live', 'upcoming', 'scheduled', 'in progress', 'playing')
+        -- 🚫 Skip matches already archived in completed_matches
+        AND m.id::text NOT IN (SELECT match_id FROM completed_matches)
+      ORDER BY m.start_time DESC;
     `);
     return res.rows;
   } catch (err) {
@@ -567,6 +790,19 @@ export async function getPastActiveMatches() {
     return [];
   }
 }
+
+export async function getUpcomingMatches() {
+  const res = await pool.query(`
+    SELECT id, name, start_time
+      FROM matches
+     WHERE LOWER(status) IN ('upcoming', 'scheduled')
+       AND start_time > NOW()
+     ORDER BY start_time ASC
+  `);
+  return res.rows;
+}
+
+
 
 // Get all live matches (status = 'LIVE')
 export async function getLiveMatches() {
@@ -589,6 +825,35 @@ export async function insertLiveScoreSnapshot(data) {
       JSON.stringify(data.source),
     ]
   );
+}
+async function archiveCompletedMatch(match) {
+  try {
+    await query(
+      `
+      INSERT INTO completed_matches (
+        match_id, team_a, team_b, start_time, venue, toss_info, result, completed_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+      ON CONFLICT (match_id) DO NOTHING;
+      `,
+      [
+        match.match_id,   // from matches.id
+        match.team_a,     // from api_payload->team1->teamname
+        match.team_b,     // from api_payload->team2->teamname
+        match.start_time, // from table column
+        match.venue,      // from api_payload->venueinfo->ground
+        match.toss_info,  // from api_payload->tossstatus
+        match.result || null,
+      ]
+    );
+
+    // After successful insert, remove the original record
+    await query(`DELETE FROM matches WHERE id = $1`, [match.match_id]);
+
+    console.log(`✅ [Archive] Match ${match.match_id} moved to completed_matches.`);
+  } catch (err) {
+    console.error(`❌ [Archive] Failed for ${match.match_id}:`, err.message);
+  }
 }
 
 // Update summary text in matches table
@@ -649,53 +914,75 @@ export async function updateMatchStatus(matchId, newStatus) {
 // =====================================================
 
 // 🔍 Fetch all user wallets that have deposit addresses
-export async function getAllUserWallets() {
+export async function getAllUserWallets(network = "TRON") {
   try {
     const res = await pool.query(
-      `SELECT telegram_id, deposit_address FROM users WHERE deposit_address IS NOT NULL`
+      `SELECT telegram_id, deposit_address
+         FROM user_wallets
+        WHERE deposit_address IS NOT NULL
+          AND network = $1`,
+      [network]
     );
     return res.rows;
   } catch (err) {
-    console.error("❌ [DB] getAllUserWallets error:", err);
+    console.error("❌ [DB] getAllUserWallets error:", err.message);
     return [];
   }
 }
 
 // 💰 Credit user’s balance when a deposit is detected
-export async function creditUserDeposit(telegramId, amount) {
+export async function creditUserDeposit(telegramId, amount, network = "TRON") {
+  const client = await pool.connect();
   try {
-    // 🧠 1️⃣ Ensure the user has a balance record
-    await pool.query(
+    await client.query("BEGIN");
+
+    // 1️⃣ Ensure wallet exists
+    const walletRes = await client.query(
+      `SELECT deposit_address FROM user_wallets WHERE telegram_id = $1 AND network = $2`,
+      [telegramId, network]
+    );
+
+    if (walletRes.rowCount === 0) {
+      console.warn(`⚠️ [DB] No wallet found for user ${telegramId}, skipping credit.`);
+      await client.query("ROLLBACK");
+      return false;
+    }
+
+    // 2️⃣ Ensure a balances row exists
+    await client.query(
       `INSERT INTO balances (telegram_id, tokens, bonus_tokens, usdt)
        VALUES ($1, 0, 200, 0)
        ON CONFLICT (telegram_id) DO NOTHING`,
       [telegramId]
     );
 
-    // 🪙 2️⃣ Add credited amount to tokens
-    const res = await pool.query(
+    // 3️⃣ Credit USDT or G-tokens (you can adjust this logic)
+    const res = await client.query(
       `UPDATE balances
-         SET tokens = tokens + $1
+         SET usdt = usdt + $1
        WHERE telegram_id = $2
-       RETURNING tokens`,
+       RETURNING usdt`,
       [amount, telegramId]
     );
 
-    if (res.rowCount === 0) {
-      console.warn(`⚠️ [DB] No balance row found for user ${telegramId}`);
-    } else {
-      console.log(`💵 [DB] Credited ${amount} G-Tokens to user ${telegramId}`);
-    }
-
-    // 🕓 3️⃣ Update user's last deposit timestamp
-    await pool.query(
-      `UPDATE users
-         SET last_deposit = NOW()
-       WHERE telegram_id = $1`,
-      [telegramId]
+    // 4️⃣ Mirror balances into user_wallets for real-time sync
+    await client.query(
+      `UPDATE user_wallets
+          SET last_balance_usdt = COALESCE(last_balance_usdt, 0) + $1,
+              updated_at = NOW()
+        WHERE telegram_id = $2 AND network = $3`,
+      [amount, telegramId, network]
     );
+
+    await client.query("COMMIT");
+    console.log(`💵 [DB] Credited ${amount} USDT to ${telegramId} (${network})`);
+    return true;
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("❌ [DB] creditUserDeposit error:", err.message);
+    return false;
+  } finally {
+    client.release();
   }
 }
 
@@ -770,6 +1057,23 @@ export async function markPastDateMatchesCompleted() {
     return 0;
   }
 }
+export async function markMatchesLive() {
+  const query = `
+    UPDATE matches
+    SET status = 'live'
+    WHERE status = 'upcoming'
+      AND start_date <= NOW()
+      AND end_date > NOW()
+    RETURNING match_id;
+  `;
+
+  const { rowCount, rows } = await pool.query(query);
+  if (rowCount > 0) {
+    console.log(`🔥 [DB] ${rowCount} matches moved from upcoming → live`);
+  }
+  return rowCount;
+}
+
 export async function markMatchesAsLive() {
   try {
     const res = await pool.query(`

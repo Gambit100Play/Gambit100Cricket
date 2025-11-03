@@ -1,71 +1,55 @@
-// src/bot/handlers/matchHandler.js
 import { Markup } from "telegraf";
 import { DateTime } from "luxon";
 import { getMatches, getMatchById } from "../../db/db.js";
 import { startPreMatchBet } from "./preMatchBetHandler.js";
+import { logger as customLogger } from "../../utils/logger.js";
+
+const logger = customLogger || console;
 
 /* ============================================================
- 🕒 Universal Safe Parser for start_time
-  Handles: 
-   - "2025-10-25 03:00:00+05:30"
-   - "2025-10-25T03:00:00+05:30"
-   - date_only + time_only combo
-   - JS Date object
+ 🕒 Safe universal formatter for start_time
 ============================================================ */
-function formatStartTimeFromUTC(match) {
+function formatStartTimeFromUTC(match, userZone = "Asia/Kolkata") {
   try {
     let input = match.start_time;
 
-    // fallback if missing start_time
-    if (!input && match.date_only && match.time_only) {
-      input = `${match.date_only} ${match.time_only}`;
-    }
-
-    // NEW: support your DB schema (IST pair)
-    if (!input && match.start_date && match.start_time_local) {
-      const istStr = `${String(match.start_date).trim()} ${String(match.start_time_local).trim()}`;
-      // Try ISO-friendly form first
-      let dt = DateTime.fromISO(istStr.replace(" ", "T"), { setZone: true });
-      if (!dt.isValid) {
-        dt = DateTime.fromFormat(istStr, "yyyy-LL-dd HH:mm:ss", { zone: "Asia/Kolkata" });
-      }
-      if (dt?.isValid) {
-        return dt.setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
-      }
-    }
-
-    if (!input) return "TBA";
-
-    let dt;
+    // 🧩 Case 1: Already a Date
     if (input instanceof Date) {
-      dt = DateTime.fromJSDate(input);
-    } else if (typeof input === "string") {
+      const dt = DateTime.fromJSDate(input, { zone: "utc" }).setZone(userZone);
+      return dt.isValid ? dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ") : "Invalid DateTime";
+    }
+
+    // 🧩 Case 2: "Sat Nov 01 2025 00:00:00 GMT+0530 (India Standard Time)" OR similar
+    if (typeof input === "string" && /GMT|\b[A-Z]{3,}\b/.test(input)) {
+      const dt = DateTime.fromJSDate(new Date(input), { zone: "utc" }).setZone(userZone);
+      return dt.isValid ? dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ") : "Invalid DateTime";
+    }
+
+    // 🧩 Case 3: ISO / SQL strings
+    if (typeof input === "string") {
       let normalized = input.trim().replace(" ", "T");
-      dt = DateTime.fromISO(normalized, { setZone: true });
-
-      if (!dt.isValid) {
-        dt = DateTime.fromFormat(input.trim(), "yyyy-MM-dd HH:mm:ssZZ", { setZone: true });
-      }
-      if (!dt.isValid) {
-        dt = DateTime.fromFormat(input.trim(), "yyyy-MM-dd HH:mm:ss", { zone: "Asia/Kolkata" });
-      }
+      if (!/[Z+-]\d{2}/.test(normalized)) normalized += "Z";
+      const dt = DateTime.fromISO(normalized, { zone: "utc" }).setZone(userZone);
+      return dt.isValid ? dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ") : "Invalid DateTime";
     }
 
-    if (!dt?.isValid) {
-      console.warn("⚠️ [Luxon Parse Failed for]", input);
-      return "TBA";
+    // 🧩 Case 4: Fallback with start_date + local time
+    if (!input && match.start_date && match.start_time_local) {
+      const dateStr = `${match.start_date} ${match.start_time_local}`;
+      const dt = DateTime.fromFormat(dateStr, "yyyy-LL-dd HH:mm:ss", { zone: "utc" }).setZone(userZone);
+      return dt.isValid ? dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ") : "TBA";
     }
 
-    return dt.setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
-  } catch (err) {
-    console.error("❌ [formatStartTimeFromUTC] Error:", err.message);
     return "TBA";
+  } catch (err) {
+    logger.error(`❌ [formatStartTimeFromUTC] ${err.message}`);
+    return "Invalid DateTime";
   }
 }
 
 
 /* ============================================================
- 🌍 Get user timezone based on Telegram locale
+ 🌍 Determine user's timezone by locale
 ============================================================ */
 function getUserTimeZone(ctx) {
   const locale = ctx.from?.language_code?.toLowerCase() || "en";
@@ -77,38 +61,31 @@ function getUserTimeZone(ctx) {
     ar: "Asia/Dubai",
     ru: "Europe/Moscow",
     id: "Asia/Jakarta",
+    nl: "Europe/Amsterdam",
   };
   return regionMap[locale] || "Asia/Kolkata";
 }
 
 /* ============================================================
- 📱 Match Handler
+ 📱 Main Match Handler
 ============================================================ */
 export default function matchHandler(bot) {
   bot.action("matches", async (ctx) => {
-    try {
-      await ctx.answerCbQuery("Loading matches...");
-    } catch {}
+    try { await ctx.answerCbQuery("Loading matches..."); } catch {}
     await showMatches(ctx);
   });
 
   bot.action("matches_refresh", async (ctx) => {
-    try {
-      await ctx.answerCbQuery("Refreshing...");
-    } catch {}
+    try { await ctx.answerCbQuery("Refreshing..."); } catch {}
     await showMatches(ctx);
   });
 
   bot.action("disabled_live", async (ctx) => {
-    try {
-      await ctx.answerCbQuery("🔒 Live predictions will open once the toss is done!");
-    } catch {}
+    try { await ctx.answerCbQuery("🔒 Live predictions will open once toss is done!"); } catch {}
   });
 
   bot.action("disabled_pre", async (ctx) => {
-    try {
-      await ctx.answerCbQuery("🔒 Pre-match predictions closed — match is live!");
-    } catch {}
+    try { await ctx.answerCbQuery("🔒 Pre-match predictions closed — match is live!"); } catch {}
   });
 
   // 🎯 Predict Now
@@ -118,22 +95,22 @@ export default function matchHandler(bot) {
     const match = await getMatchById(matchId);
     if (!match) return ctx.reply("❌ Match not found or has expired.");
 
+    const userZone = getUserTimeZone(ctx);
     const status = (match.status || "").toLowerCase();
     const isLive = /(live|in progress|playing)/.test(status);
 
+    // Parse toss info
     let payload = {};
     try {
-      payload =
-        typeof match.api_payload === "object"
-          ? match.api_payload
-          : JSON.parse(match.api_payload || "{}");
+      payload = typeof match.api_payload === "object"
+        ? match.api_payload
+        : JSON.parse(match.api_payload || "{}");
     } catch (err) {
-      console.warn("⚠️ Could not parse match.api_payload:", err.message);
+      logger.warn(`⚠️ Could not parse payload: ${err.message}`);
     }
 
     const tossWinner =
       payload?.tossResults?.tossWinnerName ||
-      payload?.tossResults?.tossWinner ||
       payload?.tossWinnerName ||
       payload?.tossWinner ||
       payload?.toss_winner ||
@@ -156,11 +133,10 @@ export default function matchHandler(bot) {
       : "🕓 *Toss:* Not yet done";
 
     const isEligibleForLive = isLive || tossDone;
-
-    const when = formatStartTimeFromUTC(match);
+    const when = formatStartTimeFromUTC(match, userZone);
 
     const matchInfo = isEligibleForLive
-      ? `🏏 *${match.name}*\n📅 *Live (Toss Done):* ${when}\n📍 *Status:* 🔴 LIVE\n${tossStatus}`
+      ? `🏏 *${match.name}*\n📅 *Live:* ${when}\n📍 *Status:* 🔴 LIVE\n${tossStatus}`
       : `🏏 *${match.name}*\n📅 *Scheduled:* ${when}\n📍 *Status:* 🕓 Awaiting Toss\n${tossStatus}`;
 
     const buttons = [];
@@ -175,7 +151,6 @@ export default function matchHandler(bot) {
         Markup.button.callback("⚫ Live Match (Locked)", "disabled_live"),
       ]);
     }
-
     buttons.push([Markup.button.callback("🔙 Back to Matches", "matches")]);
 
     await ctx.reply(`${matchInfo}\n\n🎯 *Choose your prediction type:*`, {
@@ -188,95 +163,94 @@ export default function matchHandler(bot) {
   bot.action(/^prematch_(.+)/, async (ctx) => {
     await ctx.answerCbQuery();
     const matchId = ctx.match[1];
-    console.log(`🎯 [PreMatch] Triggered for match ID ${matchId}`);
-
+    logger.info(`🎯 [PreMatch Triggered] ${matchId}`);
     try {
       await startPreMatchBet(ctx, matchId);
     } catch (err) {
-      console.error("❌ Error delegating to preMatchBetHandler:", err);
+      logger.error(`❌ PreMatchBet error: ${err.message}`);
       ctx.reply("⚠️ Could not open pre-match prediction screen.");
     }
   });
 
+  // 🔴 Live placeholder
   bot.action(/^live_(.+)/, async (ctx) => {
     await ctx.answerCbQuery();
     const matchId = ctx.match[1];
-    const match = await getMatchById(matchId);
-    if (!match) return ctx.reply("❌ Match not found or has expired.");
-
-    console.log(`🔴 [LiveMatch] Triggered for match ID ${matchId}`);
-    ctx.reply(
-      "🚧 Live prediction markets will open once live data is integrated.",
-      { parse_mode: "Markdown" }
-    );
+    logger.info(`🔴 [LiveMatch Triggered] ${matchId}`);
+    ctx.reply("🚧 Live predictions coming soon.", { parse_mode: "Markdown" });
   });
 }
 
 /* ============================================================
- 🧭 Helper: Show Top 5 Matches (Live or Upcoming)
-============================================================ */
-/* ============================================================
- 🧭 Helper: Show Top 5 Matches (Live or Upcoming)
-    ➕ Added:
-      - Pool closing countdown (until toss/start)
-      - Auto respects toss (locks pre-match when toss done)
+ 🧭 Helper: Show Top 5 Matches
 ============================================================ */
 async function showMatches(ctx) {
   const matches = await getMatches();
-  if (!matches || matches.length === 0)
+  if (!matches?.length)
     return ctx.reply("📭 No live or scheduled matches available right now.");
 
   const filtered = matches
-    .filter((m) => {
-      const s = (m.status || "").toLowerCase();
-      return ["live", "in progress", "playing", "upcoming", "scheduled", "fixture"].some((x) =>
-        s.includes(x)
-      );
-    })
-    .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
+    .filter((m) =>
+      ["live", "in progress", "playing", "upcoming", "scheduled", "fixture"].some((x) =>
+        (m.status || "").toLowerCase().includes(x)
+      )
+    )
+    .sort((a, b) => new Date(a.start_time || a.start_date) - new Date(b.start_time || b.start_date))
     .slice(0, 5);
 
-  if (filtered.length === 0)
+  if (!filtered.length)
     return ctx.reply("📭 No live or scheduled matches available right now.");
+
+  const userZone = getUserTimeZone(ctx);
+  const nowLocal = DateTime.now().setZone(userZone);
 
   await ctx.reply("📅 *Top 5 Matches (Live or Upcoming)*", { parse_mode: "Markdown" });
 
   for (const m of filtered) {
-    const isLive = /(live|in progress|playing)/.test(m.status.toLowerCase());
-    const prefix = isLive ? "🔴" : "🕓";
-    const when = formatStartTimeFromUTC(m);
+    const isLive = /(live|in progress|playing)/.test((m.status || "").toLowerCase());
+    const prefix = isLive ? "🔴 LIVE" : "🕓 UPCOMING";
+    const when = formatStartTimeFromUTC(m, userZone);
 
-    // 🧮 Countdown until start (approx for toss timing)
-    let closeInfo = "";
+    // countdown
+    let countdown = "";
     try {
-      let raw = null;
-      if (m.start_date && m.start_time_local) raw = `${m.start_date} ${m.start_time_local}`;
-      else if (m.start_time) raw = String(m.start_time).replace(" ", "T");
+      let raw = m.start_time;
+      if (raw instanceof Date) raw = raw.toISOString();
+      else if (typeof raw === "string") {
+        raw = raw.trim();
+        if (raw.includes(" ")) raw = raw.replace(" ", "T");
+        if (!/[Z+-]\d{2}/.test(raw)) raw += "Z";
+      }
 
       if (raw) {
-        const matchDT = DateTime.fromISO(raw, { zone: "Asia/Kolkata" });
-        const now = DateTime.now().setZone("Asia/Kolkata");
-        const diff = matchDT.diff(now, ["hours", "minutes"]);
-
+        const matchDT = DateTime.fromISO(raw, { zone: "utc" }).setZone(userZone);
+        const diff = matchDT.diff(nowLocal, ["hours", "minutes"]);
         if (diff.as("minutes") > 0) {
           const h = Math.floor(diff.hours);
           const mLeft = Math.floor(diff.minutes % 60);
-          const parts = [];
-          if (h > 0) parts.push(`${h}h`);
-          parts.push(`${mLeft}m`);
-          closeInfo = `⏳ *Toss in:* ${parts.join(" ")}`;
-        } else {
-          closeInfo = "🪙 *Toss likely completed*";
-        }
-      } else {
-        closeInfo = "⏳ *Toss time:* Unknown";
-      }
+          countdown = `⏳ *Starts in:* ${h > 0 ? `${h}h ` : ""}${mLeft}m`;
+        } else countdown = "🪙 *Toss likely completed*";
+      } else countdown = "⏳ *Start time:* Unknown";
     } catch (err) {
-      console.warn("⚠️ [Toss Time Calc Failed]", err.message);
-      closeInfo = "⏳ *Toss time:* Unknown";
+      logger.warn(`⚠️ [Countdown Failed] ${err.message}`);
+      countdown = "⏳ *Start time:* Unknown";
     }
 
-    const messageText = `${prefix} *${m.name}*\n📅 ${when}\n${closeInfo}`;
+    const venue = m.venue
+      ? `🏟️ ${m.venue}${m.city ? `, ${m.city}` : ""}`
+      : "🏟️ Venue TBA";
+    const seriesInfo = `${m.series_name || "Unknown Series"} (${m.match_format || "TBD"})`;
+
+    const messageText = `
+${prefix} | *${m.name}*
+🏆 *${seriesInfo}*
+📅 *${when}*
+${countdown}
+${venue}
+🌍 *Country:* ${m.country || "Unknown"}
+📍 *Status:* ${m.status?.toUpperCase() || "TBD"}
+    `.trim();
+
     const button = Markup.inlineKeyboard([
       [Markup.button.callback("🎯 Predict Now", `predict_${m.id}`)],
     ]);
@@ -290,5 +264,7 @@ async function showMatches(ctx) {
       [Markup.button.callback("🔙 Back to Main Menu", "main_menu")],
     ]),
   });
-}
 
+  const updatedAt = nowLocal.toFormat("dd LLL yyyy, hh:mm a ZZZZ");
+  await ctx.reply(`📡 *Last Updated:* ${updatedAt}`, { parse_mode: "Markdown" });
+}

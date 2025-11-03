@@ -1,25 +1,28 @@
-// src/cron/fetchMatchesCron.js
 import cron from "node-cron";
-import { fetchMatchesFromCricbuzz } from "../api/cricbuzzApi.js";
+import { ensureUpcomingMatches } from "../api/fetchAllMatches.js";
 import { DateTime } from "luxon";
+import { logger } from "../utils/logger.js";
 
 console.log("🕓 [Cron] Match Fetch Cron initialized.");
 
-// 🧩 Named export for manual trigger
 export async function fetchMatches() {
-  const now = DateTime.now().setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
-  console.log(`\n🕒 ${now} - 📅 Running Manual or Scheduled Match Fetch...`);
+  const now = DateTime.now()
+    .setZone("Asia/Kolkata")
+    .toFormat("dd LLL yyyy, hh:mm a");
+
+  const headline = `🕒 ${now} - 📅 Running Manual or Scheduled Match Fetch...`;
+  console.log(headline);
+  logger.info(headline);
+
   try {
-    const count = await fetchMatchesFromCricbuzz();
-    console.log(`✅ [MatchFetchCron] Updated ${count} active matches.`);
-    console.log("─────────────────────────────────────────────");
-    return count;
+    await ensureUpcomingMatches();
+    logger.info("✅ [MatchFetchCron] Fetch completed successfully.");
   } catch (err) {
-    console.error("❌ [MatchFetchCron] Error fetching matches:", err.message);
-    console.log("─────────────────────────────────────────────");
-    return 0;
+    const msg = `❌ [MatchFetchCron] Error fetching matches: ${err.message}`;
+    console.error(msg);
+    logger.error(msg);
   }
 }
 
-// 🕒 Schedule automatic run every 6 hours (IST)
-cron.schedule("0 */6 * * *", fetchMatches, { timezone: "Asia/Kolkata" });
+// Run every 6 hours
+cron.schedule("0 6 * * *", fetchMatches, { timezone: "Asia/Kolkata" });

@@ -2,8 +2,10 @@ import { query } from "./db.js";
 
 /**
  * 🔍 Aggregate pool info dynamically from bets table
- * - Works for full-match pool or individual bet option.
- * - Returns participants, total stake, rows per option, and progress info.
+ * Handles:
+ *   - Specific bet option
+ *   - Full pool (all bet options)
+ *   - Dynamic activation based on unique plays OR total stake
  */
 export async function getPoolInfo(
   matchId,
@@ -12,19 +14,22 @@ export async function getPoolInfo(
   minNeeded = 10
 ) {
   try {
-    let res;
+    const matchIdText = String(matchId).trim();
+    const poolTypeClean = poolType.replace(/\s+/g, "").toLowerCase();
 
-    // 🧩 Case 1: Specific bet option pool (e.g., "India to Win")
+    // -------------------------------
+    // 🎯 CASE 1 — Single bet option
+    // -------------------------------
     if (betOption) {
-      res = await query(
+      const res = await query(
         `SELECT 
            COUNT(DISTINCT telegram_id) AS participants,
            COALESCE(SUM(stake), 0) AS total_stake
          FROM bets
-         WHERE match_id = $1
-           AND LOWER(market_type) = LOWER($2)
-           AND bet_option = $3`,
-        [matchId, poolType, betOption]
+         WHERE TRIM(match_id)::text = $1
+           AND REPLACE(LOWER(market_type), ' ', '') = $2
+           AND LOWER(TRIM(bet_option)) = LOWER(TRIM($3))`,
+        [matchIdText, poolTypeClean, betOption]
       );
 
       const row = res.rows[0] || { participants: 0, total_stake: 0 };
@@ -47,55 +52,111 @@ export async function getPoolInfo(
       };
     }
 
-    // 🧩 Case 2: Full match pool (distinct players across all bet options)
-    // ✅ FIXED: count unique telegram_ids across entire match
-    const distinctRes = await query(
-      `SELECT COUNT(DISTINCT telegram_id) AS unique_players
+    // -------------------------------
+    // 🎯 CASE 2 — Full match pool
+    // -------------------------------
+    const [playersRes, distinctRes, stakeRes] = await Promise.all([
+      query(
+        `SELECT COUNT(DISTINCT telegram_id) AS unique_players
          FROM bets
-        WHERE match_id = $1
-          AND LOWER(market_type) = LOWER($2)`,
-      [matchId, poolType]
-    );
-    const uniquePlayers = Number(distinctRes.rows[0]?.unique_players || 0);
+         WHERE TRIM(match_id)::text = $1
+           AND REPLACE(LOWER(market_type), ' ', '') = $2`,
+        [matchIdText, poolTypeClean]
+      ),
+      query(
+        `SELECT COUNT(DISTINCT LOWER(TRIM(bet_option))) AS unique_plays
+         FROM bets
+         WHERE TRIM(match_id)::text = $1
+           AND REPLACE(LOWER(market_type), ' ', '') = $2`,
+        [matchIdText, poolTypeClean]
+      ),
+      query(
+        `SELECT 
+            LOWER(TRIM(bet_option)) AS key,
+            bet_option,
+            COUNT(DISTINCT telegram_id) AS participants,
+            COALESCE(SUM(stake), 0) AS total_stake
+         FROM bets
+         WHERE TRIM(match_id)::text = $1
+           AND REPLACE(LOWER(market_type), ' ', '') = $2
+         GROUP BY bet_option`,
+        [matchIdText, poolTypeClean]
+      ),
+    ]);
 
-    // Get per-option breakdown as well
-    res = await query(
-      `SELECT bet_option,
-              COUNT(DISTINCT telegram_id) AS participants,
-              COALESCE(SUM(stake), 0) AS total_stake
-       FROM bets
-       WHERE match_id = $1
-         AND LOWER(market_type) = LOWER($2)
-       GROUP BY bet_option`,
-      [matchId, poolType]
-    );
+    const uniquePlayers = Number(playersRes.rows[0]?.unique_players || 0);
+    const uniquePlays = Number(distinctRes.rows[0]?.unique_plays || 0);
+    let rows = stakeRes.rows || [];
 
-    const totalStake = res.rows.reduce(
-      (a, r) => a + Number(r.total_stake || 0),
-      0
-    );
+    // -------------------------------
+    // 🧩 Always include default options
+    // -------------------------------
+    const defaultOptions = [
+      "Team A to Win",
+      "Team B to Win",
+      "Draw / Tie",
+      "Over 300 Runs",
+      "Under 300 Runs",
+    ];
 
-    const status = uniquePlayers >= minNeeded ? "active" : "pending";
+    const existingKeys = new Set(rows.map((r) => r.key));
+    for (const opt of defaultOptions) {
+      const key = opt.toLowerCase().trim();
+      if (!existingKeys.has(key)) {
+        rows.push({ key, bet_option: opt, participants: 0, total_stake: 0 });
+      }
+    }
+
+    // 🧹 De-duplicate and preserve only one record per key
+    const seen = new Set();
+    rows = rows.filter((r) => {
+      const k = r.key.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+
+    // 🧮 Order the rows logically
+    const order = new Map(defaultOptions.map((opt, i) => [opt.toLowerCase(), i]));
+    rows.sort((a, b) => (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999));
+
+    // -------------------------------
+    // ⚙️ Compute pool status
+    // -------------------------------
+    const totalStake = rows.reduce((a, r) => a + Number(r.total_stake || 0), 0);
+    const minStakeThreshold = 100; // activate if total >= 100 G
+    const minUniquePlays = 3;
+
+    const status =
+      uniquePlays >= minUniquePlays || totalStake >= minStakeThreshold
+        ? "active"
+        : "pending";
+
     const remaining = Math.max(minNeeded - uniquePlayers, 0);
     const progressBlocks = Math.floor((uniquePlayers / minNeeded) * 10);
     const progressBar =
       "▓".repeat(progressBlocks) + "░".repeat(10 - progressBlocks);
 
+    // -------------------------------
+    // 🧾 Return aggregated data
+    // -------------------------------
     return {
-      rows: res.rows,
-      participants: uniquePlayers, // ✅ real distinct count
+      rows,
+      participants: uniquePlayers,
       totalStake,
+      uniquePlays,
       status,
       remaining,
       progress: Math.min(100, Math.floor((uniquePlayers / minNeeded) * 100)),
       progressBar,
     };
   } catch (err) {
-    console.error("❌ [DB] getPoolInfo error:", err);
+    console.error("❌ [DB] getPoolInfo error:", err.message);
     return {
       rows: [],
       participants: 0,
       totalStake: 0,
+      uniquePlays: 0,
       status: "pending",
       remaining: minNeeded,
       progress: 0,

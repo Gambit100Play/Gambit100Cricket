@@ -1,41 +1,45 @@
 // src/bot/handlers/connectWalletHandler.js
 import * as TronWebNS from "tronweb";
 import dotenv from "dotenv";
-import { Markup } from "telegraf";
-import { saveUserWallet, getUserWallet } from "../../db/db.js";
+import pkg from "pg";
 import { getAddressForUser } from "../../utils/wallet.js";
+import { logger } from "../../utils/logger.js";
 
 dotenv.config();
+const { Pool } = pkg;
 
-// ✅ Works with both tronweb v5 (CJS) and v6 (ESM)
+// ────────────────────────────────────────────────
+// 🗄 PostgreSQL connection pool
+// ────────────────────────────────────────────────
+const pool = new Pool({
+  user: process.env.PGUSER,
+  host: process.env.PGHOST,
+  database: process.env.PGDATABASE,
+  password: process.env.PGPASSWORD,
+  port: process.env.PGPORT,
+});
+
+// ────────────────────────────────────────────────
+// 🌐 Tron setup (v5/v6 safe)
+// ────────────────────────────────────────────────
 const TronWeb = TronWebNS.TronWeb ?? TronWebNS.default ?? TronWebNS;
-
 if (typeof TronWeb !== "function") {
   console.error("[tronweb] export keys:", Object.keys(TronWebNS || {}));
-  throw new Error(
-    "tronweb import did not expose a constructor. " +
-      "Check your installed version with `npm ls tronweb` and ensure only one version is installed."
-  );
+  throw new Error("Invalid tronweb import — check version consistency.");
 }
 
-// ────────────────────────────────────────────────
-// 🌐 Select Mainnet or Shasta
-// ────────────────────────────────────────────────
 const NETWORK = (process.env.NETWORK || "mainnet").toLowerCase();
 const IS_SHASTA = NETWORK === "shasta";
-
 const tronWeb = new TronWeb({
   fullHost: IS_SHASTA ? "https://api.shasta.trongrid.io" : "https://api.trongrid.io",
   headers: process.env.TRONGRID_API_KEY
     ? { "TRON-PRO-API-KEY": process.env.TRONGRID_API_KEY }
     : undefined,
-  // privateKey not needed here (read-only ops)
 });
 
-// Track users expected to paste a withdrawal address
-const waitingForWithdrawAddr = new Map();
-
-// Simple validators
+// ────────────────────────────────────────────────
+// 🔎 Address Validation Helper
+// ────────────────────────────────────────────────
 function isValidTronAddress(addr) {
   try {
     return !!addr && tronWeb.isAddress(addr);
@@ -44,119 +48,117 @@ function isValidTronAddress(addr) {
   }
 }
 
-// UI builders
-function walletMenuKeyboard(hasWithdraw, hasDeposit) {
-  const rows = [];
-  rows.push([
-    Markup.button.callback("🔗 Link Withdrawal Wallet", "link_withdraw_wallet"),
-    Markup.button.callback("📥 Get Deposit Address", "get_deposit_address"),
-  ]);
-  if (hasWithdraw || hasDeposit) {
-    rows.push([Markup.button.callback("🔄 Refresh", "wallet_menu")]);
+// ────────────────────────────────────────────────
+// 🧩 Database Helpers
+// ────────────────────────────────────────────────
+async function getUserWallet(telegramId) {
+  const client = await pool.connect();
+  try {
+    const res = await client.query(
+      `SELECT deposit_address, last_balance_trx, last_balance_usdt
+         FROM user_wallets
+        WHERE telegram_id = $1
+        LIMIT 1`,
+      [telegramId]
+    );
+    return res.rows[0] || {};
+  } catch (err) {
+    logger.error(`❌ [connectWalletHandler] DB fetch error for ${telegramId}: ${err.message}`);
+    throw err;
+  } finally {
+    client.release();
   }
-  return Markup.inlineKeyboard(rows);
+}
+
+async function upsertUserWallet(telegramId, deposit_address) {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `INSERT INTO user_wallets (telegram_id, deposit_address)
+       VALUES ($1, $2)
+       ON CONFLICT (telegram_id)
+       DO UPDATE SET deposit_address = EXCLUDED.deposit_address`,
+      [telegramId, deposit_address]
+    );
+    logger.info(
+      `✅ [connectWalletHandler] Wallet upsert complete for ${telegramId} — ${deposit_address}`
+    );
+  } catch (err) {
+    logger.error(`❌ [connectWalletHandler] Upsert failed for ${telegramId}: ${err.message}`);
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // ────────────────────────────────────────────────
-// 📲 Main handler (DEFAULT EXPORT)
+// 🧭 Main Handler (NO UI CONFLICTS NOW)
 // ────────────────────────────────────────────────
 export default function connectWalletHandler(bot) {
-  // 🧭 Wallet menu
-  bot.action("wallet_menu", async (ctx) => {
-    await ctx.answerCbQuery();
-
-    const telegramId = ctx.from.id;
-    const userWallet = await getUserWallet(telegramId).catch(() => null);
-
-    const withdraw = userWallet?.withdrawal_address || "Not linked";
-    const deposit = userWallet?.deposit_address || "Not issued";
-
-    const text =
-      `💼 *Your CricPredict Wallet*\n\n` +
-      `🌐 *Network:* ${IS_SHASTA ? "Shasta Testnet" : "TRON Mainnet"}\n\n` +
-      `📤 *Withdrawal Wallet:*\n\`${withdraw}\`\n\n` +
-      `📥 *Deposit Address:*\n\`${deposit}\`\n\n` +
-      `• Use *Withdrawal Wallet* to receive payouts to your own TRON address.\n` +
-      `• Use *Deposit Address* to top-up G-Tokens (USDT/TRX → platform balance).`;
-
-    return ctx.editMessageText(text, {
-      parse_mode: "Markdown",
-      ...walletMenuKeyboard(!!userWallet?.withdrawal_address, !!userWallet?.deposit_address),
-    }).catch(async () => {
-      // If not an edit-able message, send a new one
-      return ctx.reply(text, {
-        parse_mode: "Markdown",
-        ...walletMenuKeyboard(!!userWallet?.withdrawal_address, !!userWallet?.deposit_address),
-      });
-    });
-  });
-
-  // 🔗 Begin linking a withdrawal wallet
-  bot.action("link_withdraw_wallet", async (ctx) => {
-    await ctx.answerCbQuery();
-    const telegramId = ctx.from.id;
-
-    waitingForWithdrawAddr.set(telegramId, true);
-    return ctx.reply(
-      "Paste your *TRON (TRX/USDT-TRC20)* wallet address (starts with `T...`).",
-      { parse_mode: "Markdown" }
-    );
-  });
-
-  // 📥 Issue / show deposit address
+  // ⚙️ Generate / Retrieve Deposit Address (called from walletHandler)
   bot.action("get_deposit_address", async (ctx) => {
     await ctx.answerCbQuery();
-    const telegramId = ctx.from.id;
+    const telegramId = String(ctx.from.id);
+    logger.info(`📥 [connectWalletHandler] get_deposit_address triggered by ${telegramId}`);
 
     try {
-      // Derive from your HD wallet logic
-      const depositAddress = await getAddressForUser(telegramId);
+      let { deposit_address } = await getUserWallet(telegramId);
 
-      // Persist (assumes saveUserWallet can upsert deposit address)
-      // Adjust to your actual signature if different:
-      // e.g., saveUserWallet(telegramId, withdrawalAddress, depositAddress)
-      await saveUserWallet(telegramId, undefined, depositAddress);
+      if (!deposit_address) {
+        deposit_address = await getAddressForUser(telegramId);
+        await upsertUserWallet(telegramId, deposit_address);
+        logger.info(`✅ [connectWalletHandler] Generated new deposit for ${telegramId}`);
+      }
 
-      const msg =
-        `📥 *Your Deposit Address*\n\`${depositAddress}\`\n\n` +
-        `Send *USDT (TRC-20)* or *TRX* here. Credits appear after our watcher confirms the tx.`;
-
-      return ctx.reply(msg, { parse_mode: "Markdown" });
+      await ctx.reply(
+        `📮 *Your Deposit Address*:\n\`${deposit_address}\`\n\n` +
+          `Network: *${IS_SHASTA ? "Shasta Testnet" : "TRON Mainnet"}*\n\n` +
+          `Use this to deposit *USDT (TRC-20)* or *TRX* for predictions.\n\n` +
+          `🔍 [View on Tronscan](https://${
+            IS_SHASTA ? "shasta" : "tronscan"
+          }.org/#/address/${deposit_address})`,
+        { parse_mode: "Markdown", disable_web_page_preview: true }
+      );
     } catch (err) {
-      console.error("[DepositAddress] error:", err);
-      return ctx.reply("⚠️ Could not generate your deposit address. Please try again.");
+      logger.error(
+        `❌ [connectWalletHandler] Deposit address fetch failed for ${telegramId}: ${err.message}`
+      );
+      await ctx.reply("⚠️ Could not generate your deposit address. Please try again later.");
     }
   });
 
-  // 📨 Capture pasted withdrawal addresses (only when expected)
-  bot.on("text", async (ctx, next) => {
-    const telegramId = ctx.from.id;
-
-    if (!waitingForWithdrawAddr.get(telegramId)) {
-      return next();
-    }
-
-    const addr = (ctx.message?.text || "").trim();
-
-    if (!isValidTronAddress(addr)) {
-      return ctx.reply(
-        "❌ That doesn’t look like a valid TRON address. It should start with `T`.\nPlease try again or tap /cancel.",
-        { parse_mode: "Markdown" }
-      );
-    }
+  // 💰 Check Balance (still useful for balance button)
+  bot.action("check_balance", async (ctx) => {
+    await ctx.answerCbQuery();
+    const telegramId = String(ctx.from.id);
+    logger.info(`💰 [connectWalletHandler] check_balance triggered for ${telegramId}`);
 
     try {
-      // Persist (assumes saveUserWallet can upsert withdrawal address)
-      await saveUserWallet(telegramId, addr, undefined);
-      waitingForWithdrawAddr.delete(telegramId);
+      const wallet = await getUserWallet(telegramId);
+      if (!wallet.deposit_address) {
+        return ctx.reply(
+          "❌ No wallet found yet. Tap *Generate Deposit Address* to create one.",
+          { parse_mode: "Markdown" }
+        );
+      }
 
-      return ctx.reply(
-        `✅ Withdrawal wallet linked:\n\`${addr}\`\n\nUse /wallet to open the menu.`,
+      const { deposit_address, last_balance_trx, last_balance_usdt } = wallet;
+
+      await ctx.reply(
+        `💰 *Your Wallet Overview*\n\n` +
+          `Address: \`${deposit_address}\`\n\n` +
+          `• ⚡ TRX: \`${last_balance_trx || 0}\`\n` +
+          `• 💵 USDT (TRC-20): \`${last_balance_usdt || 0}\`\n\n` +
+          `Balances auto-update after each on-chain confirmation.`,
         { parse_mode: "Markdown" }
       );
+
+      logger.info(
+        `📊 [connectWalletHandler] Displayed wallet for ${telegramId}: TRX=${last_balance_trx}, USDT=${last_balance_usdt}`
+      );
     } catch (err) {
-      console.error("[LinkWithdraw] error:", err);
-      return ctx.reply("⚠️ Could not save your wallet right now. Please try again.");
+      logger.error(`❌ [connectWalletHandler] Balance fetch failed: ${err.message}`);
+      await ctx.reply("⚠️ Unable to fetch wallet balance right now.");
     }
   });
 }

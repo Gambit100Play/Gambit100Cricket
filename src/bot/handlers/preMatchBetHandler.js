@@ -1,211 +1,289 @@
 import { Markup } from "telegraf";
-import { getMatchById, getDynamicOdds } from "../../db/db.js";
+import { getMatchById, getDynamicOdds, query } from "../../db/db.js";
 import { DateTime } from "luxon";
-import { getPoolInfo, getPoolStatus } from "../../db/poolLogic.js";
+import { getPoolInfo } from "../../db/poolLogic.js";
+import { logger } from "../../utils/logger.js";
 
 global.matchIdMap = global.matchIdMap || new Map();
 
 /* ============================================================
- 🕒 Convert match start time to readable IST format
+ 🕒 Convert UTC → readable IST
 ============================================================ */
 function formatStartIST(input) {
   if (!input) return "TBA";
-  let dt;
-  if (input instanceof Date) dt = DateTime.fromJSDate(input);
-  else if (typeof input === "string")
-    dt = input.includes("T") ? DateTime.fromISO(input) : DateTime.fromSQL(input);
-  else if (typeof input === "number") dt = DateTime.fromMillis(input);
+  try {
+    let dt;
+    if (input instanceof Date) dt = DateTime.fromJSDate(input);
+    else if (typeof input === "string")
+      dt = input.includes("T")
+        ? DateTime.fromISO(input)
+        : DateTime.fromSQL(input);
+    else if (typeof input === "number") dt = DateTime.fromMillis(input);
 
-  if (!dt || !dt.isValid) return "Invalid Time";
-  return dt.setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
+    if (!dt?.isValid) return "Invalid Time";
+    return dt.setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
+  } catch (err) {
+    logger.error(`🕒 [formatStartIST] Failed: ${err.message}`);
+    return "Invalid Time";
+  }
 }
 
 /* ============================================================
- 🧩 Core pre-match betting screen builder
+ 🧩 Build Pre-Match Screen
 ============================================================ */
 async function buildPreMatchScreen(ctx, matchId) {
-  const match = await getMatchById(matchId);
-  if (!match) return ctx.reply("❌ Match not found in database.");
+  logger.info(`🎯 [PreMatchScreen] Building for Match ID: ${matchId}`);
 
-  // ---- Team names parsing ----
-  let teamA = "Team A";
-  let teamB = "Team B";
+  const match = await getMatchById(matchId);
+  if (!match) {
+    logger.warn(`❌ Match ${matchId} not found in DB`);
+    return ctx.reply("❌ Match not found in database.");
+  }
+
+  // --- Parse payload safely ---
   let payload = {};
+  let teamA = match.team1 || "Team A";
+  let teamB = match.team2 || "Team B";
+
   try {
-    payload =
+    const raw =
       typeof match.api_payload === "object"
         ? match.api_payload
         : JSON.parse(match.api_payload || "{}");
 
-    if (Array.isArray(payload.teams) && payload.teams.length === 2)
-      [teamA, teamB] = payload.teams;
+    if (raw?.team1?.teamName && raw?.team2?.teamName) {
+      teamA = raw.team1.teamName;
+      teamB = raw.team2.teamName;
+    }
+    payload = raw;
   } catch (err) {
-    console.warn("⚠️ Error parsing api_payload:", err.message);
+    logger.warn(`⚠️ [PreMatch] Invalid api_payload: ${err.message}`);
+  }
+
+  /* --- Defensive fallback for null or empty payload --- */
+  if (!payload || Object.keys(payload).length === 0) {
+    logger.warn(`⚠️ [PreMatch] api_payload missing for ${matchId}, using DB fallback`);
+    payload = {
+      team1: { teamName: match.team1 || "Team A" },
+      team2: { teamName: match.team2 || "Team B" },
+      venueInfo: {
+        ground: match.venue || "Unknown Ground",
+        city: match.city || "",
+        country: match.country || "Unknown",
+      },
+      matchFormat: match.match_format || "Unknown",
+      state: match.status || "upcoming",
+    };
   }
 
   const when = formatStartIST(match.start_time);
+  logger.info(`🕒 Match scheduled at: ${when}`);
 
-  // ---- Unified Pool Info ----
-  const minNeeded = 10;
+  // --- Pool info ---
   const pool = await getPoolInfo(matchId, "PreMatch");
-  const participants = pool?.participants || 0;
-  const status = getPoolStatus(participants, minNeeded);
-  const remaining = Math.max(minNeeded - participants, 0);
-  const progressBar = pool?.progressBar || "░░░░░░░░░░";
+  logger.info(`🏊 Pool Info: ${pool ? pool.status : "No pool found"}`);
 
-  const poolHeader =
-    `👥 *Players Joined:* ${participants}/${minNeeded}\n` +
-    `Progress: ${progressBar} (${pool?.progress || 0}%)\n` +
-    (status === "pending"
-      ? `🚧 Pool not active yet — ${remaining} more needed to activate.\n\n`
-      : "✅ Pool active — odds are live!\n\n");
+  // --- Distinct plays ---
+  const distinctRes = await query(
+    `SELECT COUNT(DISTINCT LOWER(bet_option)) AS unique_plays
+     FROM bets WHERE match_id=$1 AND LOWER(market_type)=LOWER($2)`,
+    [matchId, "PreMatch"]
+  );
+  const distinctPlays = Number(distinctRes.rows[0]?.unique_plays || 0);
+  const status = distinctPlays >= 3 ? "active" : "pending";
+  const isLocked = pool?.status === "locked" || status === "locked";
 
-  // ---- Odds ----
+  logger.info(
+    `🎮 Pool Status → distinct_plays=${distinctPlays}, status=${status}, locked=${isLocked}`
+  );
+
+  const poolHeader = isLocked
+    ? `🔒 *Predictions Closed*\nToss occurred — pre-match predictions are now locked.\n\n`
+    : status === "pending"
+    ? `🚧 *Pool not active yet — waiting for more players to join.*\n💬 It’ll activate soon once enough plays are placed.\n\n`
+    : `✅ *Pool active — live odds running!*\n\n`;
+
+  // --- Odds ---
   const oddsData = await getDynamicOdds(matchId, "PreMatch");
+  logger.info(`🎲 getDynamicOdds → ${oddsData?.length || 0} rows`);
+  if (oddsData?.length)
+    logger.info(`🎲 Odds Table:\n${JSON.stringify(oddsData, null, 2)}`);
+
   const oddsMap = {};
-  for (const o of oddsData) oddsMap[o.bet_option] = o.odds;
+  for (const o of oddsData || [])
+    oddsMap[o.bet_option.toLowerCase().trim()] = o.odds;
+  logger.info(`🧩 OddsMap keys: [${Object.keys(oddsMap).join(", ")}]`);
 
-  const showOdds = (opt) => (oddsMap[opt] ? `${oddsMap[opt]}x` : "1.00x");
+  const showOdds = (opt) => {
+    if (status !== "active") return "";
+    const key = opt.toLowerCase().trim();
+    const base = key.replace(" to win", "").trim();
+    const found = oddsMap[key] || oddsMap[base];
+    return found ? ` (${found}x)` : "";
+  };
 
+  // --- Venue ---
+  const venueData = payload?.venueInfo || {
+    ground: payload?.venue || match.venue || "TBA",
+    city: payload?.city || match.city || "",
+    country: payload?.country || match.country || "Unknown",
+  };
+  logger.info(
+    `🏟️ Venue parsed: ${venueData.ground}, ${venueData.city}, ${venueData.country}`
+  );
+
+  // --- Safe encoder ---
   const shortId = String(matchId).slice(0, 8);
   global.matchIdMap.set(shortId, matchId);
-  const safe = (t) => encodeURIComponent(t);
+  const safe = (t) =>
+    encodeURIComponent(
+      String(t)
+        .replace(/['"`\\]+/g, "") // remove quotes/backslashes
+        .replace(/\s+/g, " ") // collapse spaces
+        .trim()
+    );
 
-  // ---- Options ----
-  const options = [
-    `${teamA} to Win`,
-    `${teamB} to Win`,
-    "Draw / Tie",
-    "Over 300 Runs",
-    "Under 300 Runs",
-  ];
+  // --- Keyboard ---
+  const buttons = isLocked
+    ? [[Markup.button.callback("🔒 Predictions Locked (Toss Done)", "noop_locked")]]
+    : [
+        [
+          Markup.button.callback(
+            `🏆 ${teamA}${showOdds(`${teamA} to Win`)}`,
+            `play_prematch|${shortId}|${safe(`${teamA} to Win`)}`
+          ),
+          Markup.button.callback(
+            `🏆 ${teamB}${showOdds(`${teamB} to Win`)}`,
+            `play_prematch|${shortId}|${safe(`${teamB} to Win`)}`
+          ),
+        ],
+        [
+          Markup.button.callback(
+            `🤝 Draw / Tie${showOdds("Draw / Tie")}`,
+            `play_prematch|${shortId}|${safe("Draw / Tie")}`
+          ),
+        ],
+        [
+          Markup.button.callback(
+            `📊 Over 300 Runs${showOdds("Over 300 Runs")}`,
+            `play_prematch|${shortId}|${safe("Over 300 Runs")}`
+          ),
+          Markup.button.callback(
+            `📉 Under 300 Runs${showOdds("Under 300 Runs")}`,
+            `play_prematch|${shortId}|${safe("Under 300 Runs")}`
+          ),
+        ],
+        [Markup.button.callback("🔄 Refresh Pool", `refresh_pool_${shortId}`)],
+      ];
 
-  // ---- Inline Keyboard ----
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback(
-        `🏆 ${teamA} (${showOdds(`${teamA} to Win`)})`,
-        `bet_prematch|${shortId}|${safe(`${teamA} to Win`)}`
-      ),
-      Markup.button.callback(
-        `🏆 ${teamB} (${showOdds(`${teamB} to Win`)})`,
-        `bet_prematch|${shortId}|${safe(`${teamB} to Win`)}`
-      ),
-    ],
-    [
-      Markup.button.callback(
-        `🤝 Draw / Tie (${showOdds("Draw / Tie")})`,
-        `bet_prematch|${shortId}|${safe("Draw / Tie")}`
-      ),
-    ],
-    [
-      Markup.button.callback(
-        `📊 Over 300 Runs (${showOdds("Over 300 Runs")})`,
-        `bet_prematch|${shortId}|${safe("Over 300 Runs")}`
-      ),
-      Markup.button.callback(
-        `📉 Under 300 Runs (${showOdds("Under 300 Runs")})`,
-        `bet_prematch|${shortId}|${safe("Under 300 Runs")}`
-      ),
-    ],
-    [Markup.button.callback("🔄 Refresh Pool", `refresh_pool_${shortId}`)],
-  ]);
-
-  // ---- Final Message ----
+  // --- Final message ---
   await ctx.reply(
     `🟢 *Pre-Match Predictions* — ${match.name}\n\n` +
       `📅 *Scheduled:* ${when} IST\n` +
-      `🏟️ *Venue:* ${payload.venue || "TBA"}\n` +
-      `🧾 *Format:* ${payload.matchType || "Unknown"}\n\n` +
+      `🏟️ *Venue:* ${venueData.ground}${
+        venueData.city ? `, ${venueData.city}` : ""
+      }\n` +
+      `🌍 *Country:* ${venueData.country}\n` +
+      `🧾 *Format:* ${
+        payload?.matchFormat || match.match_format || "Unknown"
+      }\n\n` +
       poolHeader +
-      `Each market below is part of this single shared pool.\n` +
-      `Once the pool reaches ${minNeeded} players, odds will go live.\n\n` +
-      `🎯 *Select your market below:*`,
-    { parse_mode: "Markdown", ...keyboard }
+      `Select a market below to lock your 100 G play.`,
+    { parse_mode: "Markdown", ...Markup.inlineKeyboard(buttons) }
   );
 }
 
 /* ============================================================
- 📲 External entry point
+ 📲 Entry point
 ============================================================ */
 export async function startPreMatchBet(ctx, matchId) {
-  console.log("🎯 Delegated Pre-Match start for ID:", matchId);
-  await buildPreMatchScreen(ctx, matchId);
+  logger.info(`🎯 [PreMatch Triggered] ${matchId}`);
+  try {
+    await buildPreMatchScreen(ctx, matchId);
+  } catch (err) {
+    logger.error(`❌ PreMatchBet error: ${err.message}`);
+    try {
+      await ctx.reply("⚠️ Failed to load pre-match screen. Please retry shortly.");
+    } catch {}
+  }
 }
 
 /* ============================================================
- 🧩 Register handlers for odds refresh + bet selection
+ 🧩 Handler registration
 ============================================================ */
 export default function preMatchBetHandler(bot) {
-  /* ---------------- Refresh Pool ---------------- */
+  // 🔄 Refresh pool
   bot.action(/^refresh_pool_(.+)/, async (ctx) => {
     const shortId = ctx.match[1];
     const matchId = global.matchIdMap.get(shortId) || shortId;
-
+    logger.info(`🔄 [RefreshPool] Triggered for ${matchId}`);
     try {
       await ctx.answerCbQuery("🔄 Refreshing pool data...");
-    } catch {}
-
-    const pool = await getPoolInfo(matchId, "PreMatch");
-    const minNeeded = 10;
-    const participants = pool?.participants || 0;
-    const remaining = Math.max(minNeeded - participants, 0);
-    const status = getPoolStatus(participants, minNeeded);
-
-    const msg =
-      `📊 *Pool Summary*\n\n` +
-      `👥 Players Joined: ${participants}/${minNeeded}\n` +
-      (status === "pending"
-        ? `🚧 Pool not active yet — ${remaining} more players needed.`
-        : "✅ Pool active — odds are live!");
-
-    try {
-      await ctx.editMessageText(msg, { parse_mode: "Markdown" });
-    } catch {
-      await ctx.reply(msg, { parse_mode: "Markdown" });
+      await buildPreMatchScreen(ctx, matchId);
+    } catch (err) {
+      logger.error(`⚠️ [RefreshPool] Failed: ${err.message}`);
     }
   });
 
-  /* ---------------- Bet Selection ---------------- */
-  bot.action(/^bet_prematch\|(.+)\|(.+)$/, async (ctx) => {
+  // 🎯 Play selection
+  bot.action(/^play_prematch\|(.+)\|(.+)$/, async (ctx) => {
     try {
-      await ctx.answerCbQuery("🪙 Loading bet details...");
+      await ctx.answerCbQuery("🎯 Loading play details...");
       const shortId = ctx.match[1];
-      const betOption = decodeURIComponent(ctx.match[2]);
+      const playOption = decodeURIComponent(ctx.match[2]);
       const matchId = global.matchIdMap.get(shortId) || shortId;
+      logger.info(`🎯 [PlaySelected] "${playOption}" for match ${matchId}`);
+
       const match = await getMatchById(matchId);
-      if (!match) return;
+      if (!match) return ctx.reply("❌ Match not found in database.");
 
-      // Only fetch unified pool info
       const pool = await getPoolInfo(matchId, "PreMatch");
-      const minNeeded = 10;
-      const participants = pool?.participants || 0;
-      const status = getPoolStatus(participants, minNeeded);
-      const remaining = Math.max(minNeeded - participants, 0);
-
-      const poolMsg =
-        status === "pending"
-          ? `🚧 Pool not active yet — ${remaining} more players needed to activate.`
-          : "✅ Pool active — Odds are live!";
-
-      // 🔹 Prevent duplicate messages: only one output path
-      if (typeof bot.startBet === "function") {
-        return await bot.startBet(ctx, match.name, "PreMatch", betOption, matchId);
+      if (pool?.status === "locked") {
+        return ctx.reply(
+          `🔒 Predictions are closed for *${match.name}*.\nToss has occurred.`,
+          { parse_mode: "Markdown" }
+        );
       }
 
-      // fallback message if no startBet defined
+      const distinctRes = await query(
+        `SELECT COUNT(DISTINCT LOWER(bet_option)) AS unique_plays
+         FROM bets WHERE match_id=$1 AND LOWER(market_type)=LOWER($2)`,
+        [matchId, "PreMatch"]
+      );
+      const distinctPlays = Number(distinctRes.rows[0]?.unique_plays || 0);
+      const status = distinctPlays >= 3 ? "active" : "pending";
+      const poolMsg =
+        status === "pending"
+          ? "🚧 Pool not active yet — it’ll activate soon once more plays are placed."
+          : "✅ Pool active — Odds are live!";
+
+      if (typeof bot.startPlay === "function") {
+        return await bot.startPlay(ctx, match.name, "PreMatch", playOption, matchId);
+      }
+
       await ctx.reply(
-        `🎯 *${match.name}*\n` +
-          `📊 Market: *${betOption}*\n` +
-          `${poolMsg}\n\n` +
-          `💰 Please enter your stake amount next.`,
-        { parse_mode: "Markdown" }
+        `🎯 *${match.name}*\n📊 Market: *${playOption}*\n${poolMsg}\n\n💰 Fixed play: 100 G\nSelect below:`,
+        {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard([
+            [{ text: "💰 Place Play (100 G)", callback_data: "play_confirm_100g" }],
+            [{ text: "❌ Cancel Play", callback_data: "cancel_play" }],
+            [{ text: "🏠 Main Menu", callback_data: "main_menu" }],
+          ]),
+        }
       );
     } catch (err) {
-      console.error("❌ Error handling pre-match bet:", err);
+      logger.error(`❌ [PreMatchPlay] Error: ${err.message}`);
       try {
-        await ctx.answerCbQuery("⚠️ Failed to load bet info");
+        await ctx.answerCbQuery("⚠️ Failed to load play info");
       } catch {}
     }
+  });
+
+  // 🔒 No-op safeguard
+  bot.action("noop_locked", async (ctx) => {
+    try {
+      await ctx.answerCbQuery("🔒 Predictions closed after toss");
+    } catch {}
   });
 }

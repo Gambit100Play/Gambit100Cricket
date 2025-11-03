@@ -4,8 +4,14 @@
 import TronWebModule from "tronweb";
 import dotenv from "dotenv";
 import { getAllUserWallets, creditUserDeposit, query } from "../db/db.js";
+import { logger } from "../utils/logger.js";
 
 dotenv.config();
+
+// 🚫 Suppress console output globally in this module
+console.log = () => {};
+console.warn = () => {};
+console.error = () => {};
 
 // ✅ Handle TronWeb export variations (v5 → v6)
 const TronWeb =
@@ -25,107 +31,122 @@ const tronWeb = new TronWeb({
   privateKey: process.env.TRON_PRIVATE_KEY || "",
 });
 
-console.log(
-  `🌍 [DepositWatcher] Network selected: ${IS_SHASTA ? "SHASTA TESTNET" : "MAINNET"}`
+logger.info(
+  `🌍 [DepositWatcher] Network selected: ${
+    IS_SHASTA ? "SHASTA TESTNET" : "MAINNET"
+  }`
 );
 
 // ────────────────────────────────────────────────
 // 👀 Deposit Watcher Loop
 // ────────────────────────────────────────────────
 export function startDepositWatcher(bot) {
-  console.log("👀 Deposit watcher active.");
+  logger.info("👀 [DepositWatcher] Active and monitoring deposits...");
 
   setInterval(async () => {
-    console.log("🔁 [DepositWatcher] Checking user balances...");
+    logger.info("🔁 [DepositWatcher] Checking user balances...");
 
     try {
       const users = await getAllUserWallets();
+      if (!users?.length) {
+        logger.warn("⚠️ No user wallets found for balance check.");
+        return;
+      }
 
       for (const user of users) {
         const { telegram_id, deposit_address } = user;
         if (!deposit_address) continue;
 
-        // ────────────────────────────────────────────────
-        // 1️⃣ Get current on-chain balance
-        // ────────────────────────────────────────────────
-        const balanceInSun = await tronWeb.trx.getBalance(deposit_address);
-        const trxBalance = Number(tronWeb.fromSun(balanceInSun));
-
-        let usdtBalance = 0;
         try {
-          const usdtContract =
-            process.env.USDT_CONTRACT_ADDRESS ||
-            "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"; // Mainnet USDT
-          const contract = await tronWeb.contract().at(usdtContract);
-          const bal = await contract.balanceOf(deposit_address).call();
-          usdtBalance = Number(tronWeb.fromSun(bal));
-        } catch (err) {
-          console.log("⚠️ USDT check skipped:", err.message);
-        }
+          // ────────────────────────────────────────────────
+          // 1️⃣ Get current on-chain balance
+          // ────────────────────────────────────────────────
+          const balanceInSun = await tronWeb.trx.getBalance(deposit_address);
+          const trxBalance = Number(tronWeb.fromSun(balanceInSun));
 
-        console.log(
-          `👤 [${telegram_id}] TRX=${trxBalance} | USDT=${usdtBalance} @ ${deposit_address}`
-        );
+          let usdtBalance = 0;
+          try {
+            const usdtContract =
+              process.env.USDT_CONTRACT_ADDRESS ||
+              "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"; // Mainnet USDT
+            const contract = await tronWeb.contract().at(usdtContract);
+            const bal = await contract.balanceOf(deposit_address).call();
+            usdtBalance = Number(tronWeb.fromSun(bal));
+          } catch (usdtErr) {
+            logger.warn(`⚠️ [DepositWatcher] USDT check skipped: ${usdtErr.message}`);
+          }
 
-        // ────────────────────────────────────────────────
-        // 2️⃣ Compare with previous DB snapshot
-        // ────────────────────────────────────────────────
-        const prevRes = await query(
-          `SELECT last_balance_trx, last_balance_usdt FROM users WHERE telegram_id = $1`,
-          [telegram_id]
-        );
-        const prev =
-          prevRes.rows[0] || { last_balance_trx: 0, last_balance_usdt: 0 };
-
-        const diffTRX = Math.max(trxBalance - Number(prev.last_balance_trx || 0), 0);
-        const diffUSDT = Math.max(usdtBalance - Number(prev.last_balance_usdt || 0), 0);
-
-        // ────────────────────────────────────────────────
-        // 3️⃣ Credit only *new deposits*
-        // ────────────────────────────────────────────────
-        if (diffTRX > 0.001 || diffUSDT > 0.001) {
-          const isUSDT = diffUSDT > 0.001;
-          const creditTokenType = isUSDT ? "USDT" : "TRX";
-          const rawAmount = isUSDT ? diffUSDT : diffTRX;
-
-          const conversionRate = isUSDT ? 1 : 10;
-          const gTokens = rawAmount * conversionRate;
-
-          await creditUserDeposit(telegram_id, gTokens);
-
-          await query(
-            `UPDATE users
-             SET last_balance_trx = $1,
-                 last_balance_usdt = $2,
-                 last_deposit = NOW()
-             WHERE telegram_id = $3`,
-            [trxBalance, usdtBalance, telegram_id]
+          logger.info(
+            `👤 [${telegram_id}] TRX=${trxBalance} | USDT=${usdtBalance} @ ${deposit_address}`
           );
 
-          await bot.telegram.sendMessage(
-            telegram_id,
-            `💰 *Deposit Detected!*\n` +
-              `You sent ${rawAmount.toFixed(3)} ${creditTokenType}.\n` +
-              `🎯 Credited *${gTokens.toFixed(2)} G-Tokens* to your wallet.\n\n` +
-              `Your G-Token balance has been updated ✅`,
-            { parse_mode: "Markdown" }
+          // ────────────────────────────────────────────────
+          // 2️⃣ Compare with previous DB snapshot
+          // ────────────────────────────────────────────────
+          const prevRes = await query(
+            `SELECT last_balance_trx, last_balance_usdt FROM users WHERE telegram_id = $1`,
+            [telegram_id]
           );
 
-          console.log(
-            `✅ [DepositWatcher] Credited ${gTokens.toFixed(2)} G for ${telegram_id}`
-          );
-        } else {
-          await query(
-            `UPDATE users
-             SET last_balance_trx = $1,
-                 last_balance_usdt = $2
-             WHERE telegram_id = $3`,
-            [trxBalance, usdtBalance, telegram_id]
+          const prev =
+            prevRes.rows[0] || { last_balance_trx: 0, last_balance_usdt: 0 };
+
+          const diffTRX = Math.max(trxBalance - Number(prev.last_balance_trx || 0), 0);
+          const diffUSDT = Math.max(usdtBalance - Number(prev.last_balance_usdt || 0), 0);
+
+          // ────────────────────────────────────────────────
+          // 3️⃣ Credit only *new deposits*
+          // ────────────────────────────────────────────────
+          if (diffTRX > 0.001 || diffUSDT > 0.001) {
+            const isUSDT = diffUSDT > 0.001;
+            const creditTokenType = isUSDT ? "USDT" : "TRX";
+            const rawAmount = isUSDT ? diffUSDT : diffTRX;
+
+            const conversionRate = isUSDT ? 1 : 10;
+            const gTokens = rawAmount * conversionRate;
+
+            await creditUserDeposit(telegram_id, gTokens);
+
+            await query(
+              `UPDATE users
+               SET last_balance_trx = $1,
+                   last_balance_usdt = $2,
+                   last_deposit = NOW()
+               WHERE telegram_id = $3`,
+              [trxBalance, usdtBalance, telegram_id]
+            );
+
+            await bot.telegram.sendMessage(
+              telegram_id,
+              `💰 *Deposit Detected!*\n` +
+                `You sent ${rawAmount.toFixed(3)} ${creditTokenType}.\n` +
+                `🎯 Credited *${gTokens.toFixed(2)} G-Tokens* to your wallet.\n\n` +
+                `Your G-Token balance has been updated ✅`,
+              { parse_mode: "Markdown" }
+            );
+
+            logger.info(
+              `✅ [DepositWatcher] Credited ${gTokens.toFixed(
+                2
+              )} G for Telegram user ${telegram_id}`
+            );
+          } else {
+            await query(
+              `UPDATE users
+               SET last_balance_trx = $1,
+                   last_balance_usdt = $2
+               WHERE telegram_id = $3`,
+              [trxBalance, usdtBalance, telegram_id]
+            );
+          }
+        } catch (innerErr) {
+          logger.error(
+            `❌ [DepositWatcher] Error while checking user ${user.telegram_id}: ${innerErr.message}`
           );
         }
       }
     } catch (err) {
-      console.error("❌ [DepositWatcher] Error:", err.message);
+      logger.error(`💥 [DepositWatcher] Global error: ${err.message}`);
     }
-  }, 60_000); // check every 60s
+  }, 60_000); // every 60s
 }

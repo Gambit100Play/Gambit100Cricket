@@ -10,7 +10,7 @@ console.log("🕒 ScoreUpdateCron initialized...");
  * - Inserts a new row into live_scores
  * - Updates matches.score text field for quick reference
  */
-cron.schedule("*/10 * * * *", async () => {
+cron.schedule("1 6,18 * * *", async () => {
   console.log(`\n[ScoreUpdateCron] Running: ${new Date().toLocaleString("en-IN")}`);
 
   try {

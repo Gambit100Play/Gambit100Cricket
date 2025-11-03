@@ -1,6 +1,7 @@
 // src/tests/generateMasterWallet.js
 import { createRequire } from "module";
-import bip39 from "bip39";
+import { mnemonicToSeedSync, generateMnemonic } from "@scure/bip39";
+
 import pkg from "tronweb";
 const { TronWeb } = pkg;
 

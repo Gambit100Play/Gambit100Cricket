@@ -2,37 +2,16 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-import * as TronWebNS from "tronweb";
-import { createRequire } from "module";
-import bip39 from "bip39";
-
-// ESM-safe imports for BIP32 + secp256k1
-const require = createRequire(import.meta.url);
-const ecc = require("tiny-secp256k1");
-const { BIP32Factory } = require("bip32");
-const BIP32 = BIP32Factory(ecc);
+import * as TronWebModule from "tronweb";
+import { mnemonicToSeedSync, validateMnemonic } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english.js";
+import { HDKey } from "@scure/bip32";
+import { logger } from "./logger.js";
 
 // ────────────────────────────────────────────────
-// 🔌 TronWeb compat import (works with v5 CJS & v6 ESM)
+// ⚙️ Initialize TronWeb (Shasta or Mainnet)
 // ────────────────────────────────────────────────
-const TronWeb = TronWebNS.TronWeb ?? TronWebNS.default ?? TronWebNS;
-if (typeof TronWeb !== "function") {
-  console.error("[tronweb] export keys:", Object.keys(TronWebNS || {}));
-  throw new Error(
-    "tronweb import did not expose a constructor. " +
-    "Run `npm ls tronweb` and ensure only one version is installed."
-  );
-}
-
-// ────────────────────────────────────────────────
-// ⚙️ Configuration
-// ────────────────────────────────────────────────
-const MASTER_MNEMONIC = (process.env.MASTER_MNEMONIC || "").trim();
-if (!MASTER_MNEMONIC) {
-  console.error("❌ MASTER_MNEMONIC missing in .env file!");
-  throw new Error("MASTER_MNEMONIC is required");
-}
-
+const { TronWeb } = TronWebModule;
 const NETWORK = (process.env.NETWORK || "mainnet").toLowerCase();
 const IS_SHASTA = NETWORK === "shasta";
 
@@ -41,54 +20,77 @@ export const tronWeb = new TronWeb({
   headers: process.env.TRONGRID_API_KEY
     ? { "TRON-PRO-API-KEY": process.env.TRONGRID_API_KEY }
     : undefined,
-  // privateKey not needed for read-only utils
+  privateKey: process.env.TRON_PRIVATE_KEY || undefined, // optional
 });
 
+logger.info(`🌐 Tron network initialized → ${IS_SHASTA ? "Shasta Testnet" : "Mainnet"}`);
+
 // ────────────────────────────────────────────────
-// 🧩 Derive TRON Address from HD Wallet
-//   Path: m/44'/195'/0'/0/{index}
+// 🧠 Load and sanitize master mnemonic
 // ────────────────────────────────────────────────
-export async function deriveAddressForIndex(index) {
+let MASTER_MNEMONIC = (process.env.MASTER_MNEMONIC || "").trim();
+
+// 🔧 Automatically strip quotes and normalize spaces
+MASTER_MNEMONIC = MASTER_MNEMONIC
+  .replace(/^["']+|["']+$/g, "")
+  .replace(/\s+/g, " ")
+  .trim();
+
+if (!MASTER_MNEMONIC) {
+  logger.error("❌ Missing MASTER_MNEMONIC in .env file!");
+  throw new Error("MASTER_MNEMONIC is required for HD derivation.");
+}
+
+// 🧩 Validate against the English wordlist
+if (!validateMnemonic(MASTER_MNEMONIC, wordlist)) {
+  logger.error(`❌ Invalid MASTER_MNEMONIC detected: ${MASTER_MNEMONIC}`);
+  logger.error(
+    "💡 Hint: If you’re using Windows, remove quotes in .env OR let this sanitizer clean it.\n" +
+    "If it still fails, generate a valid 12-word BIP-39 mnemonic:\n" +
+    "node --input-type=module -e \"import { generateMnemonic } from '@scure/bip39'; import { wordlist } from '@scure/bip39/wordlists/english.js'; console.log(generateMnemonic(wordlist));\""
+  );
+  throw new Error("Invalid MASTER_MNEMONIC – failed BIP-39 checksum validation.");
+}
+
+logger.info("✅ Master mnemonic validated successfully.");
+
+// ────────────────────────────────────────────────
+// 🔐 Derive TRON HD wallet address at index (BIP-44, coin=195)
+// ────────────────────────────────────────────────
+export function deriveAddressForIndex(index) {
   if (!Number.isInteger(index) || index < 0) {
     throw new Error(`Invalid derivation index: ${index}`);
   }
 
-  const seed = await bip39.mnemonicToSeed(MASTER_MNEMONIC);
-  const root = BIP32.fromSeed(seed);
-
+  logger.debug(`🔢 Deriving TRON address for index ${index}...`);
+  const seed = mnemonicToSeedSync(MASTER_MNEMONIC);
+  const root = HDKey.fromMasterSeed(seed);
   const path = `m/44'/195'/0'/0/${index}`;
-  const child = root.derivePath(path);
-  if (!child.privateKey) {
-    throw new Error(`❌ No private key derived for index ${index}`);
+  const child = root.derive(path);
+
+  if (!child.privateKey) throw new Error(`No private key derived for index ${index}`);
+
+  const privHex = "0x" + child.privateKey.toString("hex");
+
+  const tronAddress = tronWeb.utils.crypto.getBase58CheckAddress(
+    tronWeb.utils.crypto.computeAddress(privHex)
+  );
+
+  if (!tronAddress || !tronAddress.startsWith("T")) {
+    throw new Error(`Invalid TRON address derived at index ${index}`);
   }
 
-  const privateKeyHex = Buffer.from(child.privateKey).toString("hex");
-
-  // Try instance method first, then static fallback (covers v5/v6 differences)
-  const fromPriv =
-    (tronWeb.address && tronWeb.address.fromPrivateKey) ||
-    (TronWeb.address && TronWeb.address.fromPrivateKey);
-
-  if (typeof fromPriv !== "function") {
-    throw new Error("TronWeb.address.fromPrivateKey is unavailable");
-  }
-
-  const address = fromPriv(privateKeyHex);
-  if (!address || typeof address !== "string" || !address.startsWith("T")) {
-    throw new Error("Invalid TRON address derivation");
-  }
-
-  // ⚠️ SECURITY: avoid returning private keys from utils unless absolutely necessary.
-  return { index, address /*, privateKey: privateKeyHex */ };
+  logger.debug(`✅ Derived TRON address ${tronAddress} (path: ${path})`);
+  return { index, tronAddress, privHex, path };
 }
 
 // ────────────────────────────────────────────────
-// 👤 Deterministic Deposit Address per Telegram User
-//   Returns a STRING address for easy use by handlers
+// 👤 Deterministic TRC-20 Deposit Address per Telegram User
 // ────────────────────────────────────────────────
-export async function getAddressForUser(telegramId) {
-  // Derive a safe bounded index (0–999999)
-  const numericIndex = Number(String(telegramId).replace(/\D/g, "")) % 1_000_000;
-  const { address } = await deriveAddressForIndex(numericIndex);
-  return address; // ← handlers expect a plain string
+export function getAddressForUser(telegramId) {
+  if (!telegramId) throw new Error("telegramId is required");
+  const numericIndex = Math.abs(Number(String(telegramId).replace(/\D/g, ""))) % 1_000_000;
+  const { tronAddress } = deriveAddressForIndex(numericIndex);
+  logger.info(`🎯 Deterministic TRON deposit address for ${telegramId}: ${tronAddress}`);
+  return tronAddress;
 }

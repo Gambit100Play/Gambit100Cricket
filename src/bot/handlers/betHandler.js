@@ -1,170 +1,177 @@
-import { placeBetWithDebit, getMatchById, query } from "../../db/db.js";
-import { getPoolInfo, getPoolStatus } from "../../db/poolLogic.js";
-import { DateTime } from "luxon";
+// src/bot/handlers/myBetsHandler.js
+import { Markup } from "telegraf";
+import {
+  getUserBets,
+  getUserBalance,
+  updateBetStatus,
+  updateUserBalance,
+} from "../../db/db.js";
+import { logger } from "../../utils/logger.js";
 
-export default function betHandler(bot) {
-  bot.startBet = async (ctx, matchName, betType, betOption, matchId) => {
-    console.log(`💰 [startBet] for ${betType} | ${matchName} | ${betOption}`);
+/**
+ * 🎟 Handles displaying and managing user's active and past plays (bets)
+ */
+export default function myBetsHandler(bot) {
+  logger.info("🧩 [INIT] myBetsHandler module attached.");
+
+  /* ============================================================
+     🎯 View My Plays (Callback Entry Point)
+  ============================================================ */
+  bot.action(["my_bets", "my_plays"], async (ctx) => {
+    const userId = ctx.from?.id;
+    logger.info(`🎟 [MyBets] Callback triggered | user=${userId}`);
 
     try {
-      const match = await getMatchById(matchId);
-      if (!match) {
-        await ctx.reply("⚠️ Match details not found. Please try again later.");
-        return;
-      }
-
-      // 🕒 Match start/lock check
-      const startTimeUTC = DateTime.fromISO(match.lock_time || match.start_time, {
-        zone: "utc",
-      });
-      if (DateTime.utc() >= startTimeUTC) {
-        await ctx.reply("🔒 Betting is closed for this match (match already started).");
-        return;
-      }
-
-      // 👥 Pool info (for display)
-      const pool = await getPoolInfo(matchId, "PreMatch");
-      const minNeeded = 10;
-      const status = getPoolStatus(pool.participants, minNeeded);
-      const remaining = Math.max(minNeeded - pool.participants, 0);
-
-      // 🕒 Time left for betting
-      const now = DateTime.utc();
-      const diff = startTimeUTC.diff(now, ["minutes", "seconds"]).toObject();
-      const mins = Math.floor(diff.minutes);
-      const secs = Math.floor(diff.seconds);
-      const timeLeftMsg = `⏳ Bet closes in ${mins}m ${secs}s`;
-
-      // 🧠 Context message
-      let poolNote =
-        status === "pending"
-          ? `🚧 *Pool not active yet — your odds will update once pool activates.*\n` +
-            `👥 *Players joined:* ${pool.participants}/${minNeeded} (${remaining} more needed)\n\n`
-          : "✅ *Pool active — odds are live!*\n\n";
-
-      // Ask for stake
-      await ctx.reply(
-        `🎯 *${matchName}*\n📊 Market: *${betOption}*\n\n${timeLeftMsg}\n\n${poolNote}` +
-          `💰 Enter your stake amount (e.g. 100):`,
-        { parse_mode: "Markdown" }
-      );
-
-      // Store flow
-      ctx.session.betFlow = {
-        matchId,
-        matchName,
-        betType,
-        betOption,
-        startedAt: Date.now(),
-        completed: false,
-      };
-
-      setTimeout(() => {
-        if (ctx.session?.betFlow && !ctx.session.betFlow.completed) {
-          ctx.session.betFlow = null;
-          ctx.reply("⌛ Bet input timed out. Please start again if you wish to bet.");
-        }
-      }, 60000);
+      await ctx.answerCbQuery("🎟 Fetching your plays...");
+      logger.debug(`✅ [MyBets] Callback answered for ${userId}`);
     } catch (err) {
-      console.error("❌ [startBet] Error:", err.message);
-      await ctx.reply("⚠️ Failed to fetch match info. Please try again later.");
+      logger.warn(`⚠️ [MyBets] Could not answer callback query: ${err.message}`);
+    }
+
+    try {
+      logger.debug(`🚀 [MyBets] Delegating to bot.myBetsHandler() for ${userId}`);
+      await bot.myBetsHandler(ctx);
+    } catch (err) {
+      logger.error(`💥 [MyBets] Delegation failed: ${err.stack}`);
+      await ctx.reply("⚠️ Could not load your plays. Please try again later.").catch(() => {});
+    }
+  });
+
+  /* ============================================================
+     ❌ Cancel a Pending Play
+  ============================================================ */
+  bot.action(/cancel_bet_(\d+)/, async (ctx) => {
+    const userId = ctx.from?.id;
+    const playIndex = parseInt(ctx.match[1], 10);
+    logger.info(`❌ [CancelPlay] Triggered | user=${userId} | playIndex=${playIndex}`);
+
+    try {
+      await ctx.answerCbQuery("Cancelling...");
+    } catch (err) {
+      logger.warn(`⚠️ [CancelPlay] Callback ack failed: ${err.message}`);
+    }
+
+    try {
+      const plays = await getUserBets(userId);
+      if (!plays?.length) return ctx.reply("⚠️ No plays found in your account.");
+
+      const play = plays[playIndex];
+      if (!play) return ctx.reply("⚠️ Could not find this play.");
+
+      if (play.status !== "Pending") {
+        return ctx.reply("❌ This play cannot be cancelled once active or completed.");
+      }
+
+      // Prevent double refund if race condition occurs
+      logger.debug(`💰 [CancelPlay] Fetching balance for ${userId}`);
+      const balance = await getUserBalance(userId);
+      const newTokens = balance.tokens + play.stake;
+
+      await Promise.all([
+        updateUserBalance(userId, newTokens, balance.bonus_tokens, balance.usdt),
+        updateBetStatus(play.id, "Cancelled", { reason: "User cancelled manually" }),
+      ]);
+
+      logger.info(`✅ [CancelPlay] Refunded ${play.stake} G | user=${userId}`);
+
+      await ctx.reply(
+        `❌ Play #${playIndex + 1} cancelled and *${play.stake} G* refunded.\n\n` +
+          `💰 Tokens: ${newTokens} G\n🎁 Bonus: ${balance.bonus_tokens} G`,
+        {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("🎟 View My Plays", "my_plays")],
+            [Markup.button.callback("🏠 Main Menu", "main_menu")],
+          ]),
+        }
+      );
+    } catch (err) {
+      logger.error(`💥 [CancelPlay] ${err.stack}`);
+      await ctx.reply("⚠️ Failed to cancel your play. Please retry shortly.").catch(() => {});
+    }
+  });
+
+  /* ============================================================
+     🌐 Delegation Function — Main Logic
+     Sends one card per bet with Cancel buttons
+  ============================================================ */
+  bot.myBetsHandler = async (ctx) => {
+    const userId = ctx.from?.id;
+    logger.info(`📲 [myBetsHandler] START | user=${userId}`);
+
+    // Telegram MarkdownV2 escape (strict)
+    const esc = (t = "") =>
+      t.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&").trim();
+
+    try {
+      logger.debug(`⚙️ [myBetsHandler] Step 1 → Fetching bets from DB`);
+      const plays = await getUserBets(userId);
+      logger.debug(`📦 [myBetsHandler] Step 1 done → ${plays?.length || 0} records`);
+
+      if (!plays?.length) {
+        logger.info(`📭 [myBetsHandler] No plays for user=${userId}`);
+        await ctx.reply(`🎟 *My Plays*\n\nYou haven’t joined any plays yet.`, {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("📅 View Matches", "matches")],
+            [Markup.button.callback("🏠 Main Menu", "main_menu")],
+          ]),
+        });
+        return;
+      }
+
+      logger.debug(`🧮 [myBetsHandler] Step 2 → Preparing cards`);
+
+      const MAX_PER_MESSAGE = 5; // group to avoid too many API calls
+      for (let i = 0; i < plays.length; i += MAX_PER_MESSAGE) {
+        const chunk = plays.slice(i, i + MAX_PER_MESSAGE);
+        const text = chunk
+          .map((p, j) => {
+            const idx = i + j + 1;
+            const status = esc(p.status || "Pending");
+            const match = esc(p.match_name || "Unknown Match");
+            const opt = esc(p.bet_option || "?");
+            const type = esc(p.bet_type || "?");
+            return (
+              `#${idx} — *${match}*\n🎯 ${opt} | ${type}\n💰 Stake: ${p.stake || 0} G\n📌 Status: *${status}*`
+            );
+          })
+          .join("\n\n");
+
+        const keyboard = Markup.inlineKeyboard([
+          ...chunk
+            .filter((p) => p.status === "Pending")
+            .map((p, j) => [
+              Markup.button.callback(`❌ Cancel Bet #${i + j + 1}`, `cancel_bet_${i + j}`),
+            ]),
+        ]);
+
+        logger.debug(
+          `💬 [myBetsHandler] Sending plays ${i + 1}–${i + chunk.length} of ${
+            plays.length
+          } to ${userId}`
+        );
+
+        await ctx.reply(`🎟 *My Plays*\n\n${text}`, {
+          parse_mode: "MarkdownV2",
+          ...keyboard,
+        });
+
+        await new Promise((r) => setTimeout(r, 300));
+      }
+
+      await ctx.reply("🏠 Return to Main Menu", {
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("🏠 Main Menu", "main_menu")],
+        ]),
+      });
+
+      logger.info(`✅ [myBetsHandler] Completed sending ${plays.length} plays | user=${userId}`);
+    } catch (err) {
+      logger.error(`💥 [myBetsHandler] Error: ${err.stack}`);
+      await ctx.reply("⚠️ Failed to load your plays. Please try again later.").catch(() => {});
+    } finally {
+      logger.info(`⏱️ [myBetsHandler] END | user=${userId}`);
     }
   };
-
-  // 💬 Handle stake input
-  bot.on("text", async (ctx, next) => {
-    if (!ctx.session.betFlow) return next();
-
-    const text = ctx.message.text.trim();
-    if (text.startsWith("/") || text.length > 10) return next();
-
-    if (ctx.session.betFlow.completed) {
-      await ctx.reply("⚠️ You've already placed this bet. Start a new one if needed.");
-      return;
-    }
-
-    const stake = Number(text);
-    if (isNaN(stake) || stake <= 0) {
-      await ctx.reply("⚠️ Please enter a valid positive number as your stake.");
-      return;
-    }
-
-    const { matchId, matchName, betType, betOption } = ctx.session.betFlow;
-    const telegramId = ctx.from.id;
-
-    try {
-      const match = await getMatchById(matchId);
-      const startTimeUTC = DateTime.fromISO(match.lock_time || match.start_time, {
-        zone: "utc",
-      });
-
-      if (DateTime.utc() >= startTimeUTC) {
-        await ctx.reply("🔒 Sorry, betting is now closed for this match.");
-        ctx.session.betFlow = null;
-        return;
-      }
-
-      // ✅ Place bet regardless of pool status
-      const result = await placeBetWithDebit({
-        telegramId,
-        matchId,
-        matchName,
-        betType,
-        betOption,
-        stake,
-      });
-
-      const { tokens, bonus_tokens, usdt } = result.balance;
-
-      // 👥 Fetch pool info again
-      let pool = await getPoolInfo(matchId, "PreMatch");
-      const minNeeded = 10;
-
-      // 🧠 Check if this player was already part of this pool
-      const checkRes = await query(
-        `SELECT 1 FROM bets WHERE telegram_id = $1 AND match_id = $2 AND LOWER(market_type) = LOWER($3) LIMIT 1`,
-        [telegramId, matchId, "PreMatch"]
-      );
-
-      // ✅ Only increase if this is their first bet in this match/pool
-      const alreadyJoined = checkRes.rowCount > 0;
-      if (!alreadyJoined) {
-        pool.participants += 1;
-      }
-
-      const status = getPoolStatus(pool.participants, minNeeded);
-      const remaining = Math.max(minNeeded - pool.participants, 0);
-
-      const poolMsg =
-        status === "pending"
-          ? `🚧 Pool not active yet — odds will update after ${remaining} more players join.`
-          : "✅ Pool active — live odds updating now!";
-
-      await ctx.reply(
-        `✅ *Bet Placed Successfully!*\n\n` +
-          `🏏 *Match:* ${matchName}\n` +
-          `🎯 *Market:* ${betOption}\n` +
-          `💰 *Stake:* ${stake} G\n\n` +
-          `${poolMsg}\n\n` +
-          `📊 *Updated Balance:*\n` +
-          `• Tokens: ${tokens}\n` +
-          `• Bonus: ${bonus_tokens}\n` +
-          `• USDT: ${usdt}`,
-        { parse_mode: "Markdown" }
-      );
-
-      ctx.session.betFlow.completed = true;
-      setTimeout(() => (ctx.session.betFlow = null), 2000);
-    } catch (err) {
-      console.error("❌ Bet Placement Error:", err.message);
-      await ctx.reply(
-        err.message.includes("INSUFFICIENT_FUNDS")
-          ? "❌ Not enough balance to place this bet."
-          : "⚠️ Failed to place bet. Please try again later."
-      );
-      ctx.session.betFlow = null;
-    }
-
-    return next();
-  });
 }

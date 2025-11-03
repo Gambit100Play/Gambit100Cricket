@@ -75,3 +75,4 @@ export async function fetchMatchesFromCricbuzz() {
     return 0;
   }
 }
+
