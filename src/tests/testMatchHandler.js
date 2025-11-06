@@ -1,143 +1,169 @@
-// src/tests/testMatchHandler.js
-import dotenv from "dotenv";
-dotenv.config();
+/**
+ * 🧪 Local Test Runner for matchHandler.dev.js
+ * --------------------------------------------
+ * Fully offline Telegram simulation (no API calls)
+ * Run with:
+ *    node src/tests/testMatchHandlerLocal.js
+ * Add --step flag to pause between steps
+ */
 
-import { logger } from "../utils/logger.js"; // ✅ always first
-logger.info("🧭 Logger initialized for testMatchHandler.js");
-
-import { getMatches } from "../db/db.js";
-import matchHandlerModule from "../bot/handlers/matchHandler.js";
+import { Telegraf } from "telegraf";
+import matchHandler from "../developing/matchHandler.dev.js";
 import { DateTime } from "luxon";
 
-/* ============================================================
- 🎭 Mock Telegram Context
-============================================================ */
+const stepMode = process.argv.includes("--step");
+
+// ──────────────────────────────────────────────
+// 🧩 Mock DB layer (replace actual imports)
+// ──────────────────────────────────────────────
+export const getMatches = async () => [
+  {
+    id: "m001",
+    match_id: 136137,
+    name: "India vs Australia",
+    series_name: "ICC T20 World Cup 2025",
+    match_desc: "12th Match",
+    match_format: "T20",
+    start_time: new Date(Date.now() + 1000 * 60 * 90).toISOString(),
+    start_date: "2025-11-06",
+    start_time_local: "19:30:00",
+    status: "scheduled",
+    team1: "India",
+    team2: "Australia",
+    venue: "Wankhede Stadium",
+    city: "Mumbai",
+    country: "India",
+    prematch_locked: false,
+    prematch_locked_at: null,
+    tron_txid: "3d6af9128f4f77e7bb0a22ab1234abcd",
+    api_payload: { tossResults: null, score: [] },
+  },
+  {
+    id: "m002",
+    match_id: 136138,
+    name: "England vs Pakistan",
+    series_name: "Bilateral Series 2025",
+    match_desc: "2nd ODI",
+    match_format: "ODI",
+    start_time: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
+    status: "live",
+    team1: "England",
+    team2: "Pakistan",
+    venue: "Lord's",
+    city: "London",
+    country: "England",
+    prematch_locked: true,
+    prematch_locked_at: new Date(),
+    tron_txid: "a1b2c3d4e5f678901234abcd5678efgh",
+    api_payload: {
+      tossResults: { tossWinnerName: "Pakistan", decision: "bowl" },
+      score: [
+        { inning: "England 1st Innings", r: 256, w: 7, o: 45.3 },
+        { inning: "Pakistan 1st Innings", r: 128, w: 3, o: 22.1 },
+      ],
+    },
+  },
+];
+
+export const getMatchById = async (id) =>
+  (await getMatches()).find((m) => m.id === id);
+
+// ──────────────────────────────────────────────
+// 🧩 Mock Telegram context (used for ctx.reply etc.)
+// ──────────────────────────────────────────────
 function createMockCtx() {
   return {
-    from: { id: 123456, first_name: "TestUser", language_code: "en" },
+    from: { id: 999999, language_code: "en" },
     reply: async (msg, opts = {}) => {
-      logger.info(`💬 BOT REPLY:\n${msg}`);
+      console.log("\n📤 [TELEGRAM REPLY]");
+      console.log("──────────────────────────────");
+      console.log(msg);
       if (opts?.reply_markup)
-        logger.info(`🎛️ Buttons: ${JSON.stringify(opts.reply_markup.inline_keyboard)}`);
+        console.log("Keyboard:", opts.reply_markup.inline_keyboard);
     },
-    answerCbQuery: async (msg) =>
-      logger.info(`✅ answerCbQuery called: ${msg || "(none)"}`),
+    answerCbQuery: async (txt) =>
+      txt && console.log(`🔘 CallbackQuery: ${txt}`),
   };
 }
 
-/* ============================================================
- 🕒 Normalize timestamps (Date, ISO, SQL)
-============================================================ */
-function normalizeTime(raw) {
-  if (!raw) return null;
-  if (raw instanceof Date) return raw.toISOString();
-  if (typeof raw === "string") {
-    const str = raw.trim();
-    if (/GMT|IST|CET|UTC/i.test(str)) return new Date(str).toISOString();
-    if (!/[Z+-]\d{2}/.test(str)) return str.replace(" ", "T") + "Z";
-    return str.replace(" ", "T");
-  }
-  return null;
+// ──────────────────────────────────────────────
+// 🧩 Step helper for --step flag
+// ──────────────────────────────────────────────
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+async function stepPause() {
+  if (!stepMode) return;
+  console.log("⏸ Press Enter to continue...");
+  process.stdin.setRawMode(true);
+  await new Promise((resolve) =>
+    process.stdin.once("data", () => {
+      process.stdin.setRawMode(false);
+      resolve();
+    })
+  );
 }
 
-/* ============================================================
- 🧪 Main Test Runner
-============================================================ */
-async function runMatchHandlerTest() {
-  logger.info("🧪 [Test] Starting Match Handler Diagnostic Test...");
+// ──────────────────────────────────────────────
+// 🧩 Simulate Bot + Handler
+// ──────────────────────────────────────────────
+async function runTest() {
+  const start = Date.now();
+  console.log("🚀 [Test] Initializing mock Telegram bot…");
+
+  const bot = new Telegraf("FAKE_TOKEN_FOR_TEST");
+
+  // 🔒 Prevent real Telegram API calls
+  bot.telegram.callApi = async (method, payload) => {
+    console.log(`🧩 [Mock API] ${method}`, payload || "");
+    return {};
+  };
+
+  // Attach the dev handler
+  matchHandler(bot);
+
   const ctx = createMockCtx();
 
-  // --- Fetch matches
-  let matches = await getMatches();
-  if (!matches?.length) {
-    logger.warn("⚠️ [Test] No matches in DB. Try running fetchAll first.");
-    return;
-  }
+  console.log("\n===========================================");
+  console.log("🧪 TEST #1 — User opens Matches list");
+  console.log("===========================================");
 
-  // --- Normalize all timestamps to UTC ISO
-  matches = matches.map((m) => ({ ...m, start_time: normalizeTime(m.start_time) }));
+  await bot.handleUpdate(
+    { callback_query: { data: "matches", from: ctx.from } },
+    ctx
+  );
 
-  logger.info(`📦 [Test] Found ${matches.length} matches in DB. Showing top 5...\n`);
+  await stepPause();
 
-  const summary = matches
-    .slice(0, 5)
-    .map((m, i) => {
-      const when = m.start_time || `${m.start_date} ${m.start_time_local}`;
-      return `${i + 1}. ${m.name || `${m.team1} vs ${m.team2}`} — ${when}`;
-    })
-    .join("\n");
+  console.log("\n===========================================");
+  console.log("🧪 TEST #2 — User clicks Predict on live match");
+  console.log("===========================================");
 
-  logger.info("📅 [Sample Matches]\n" + summary);
+  await bot.handleUpdate(
+    { callback_query: { data: "predict_m002", from: ctx.from } },
+    ctx
+  );
 
-  try {
-    const matchHandler = matchHandlerModule;
-    if (typeof matchHandler !== "function")
-      throw new Error("Handler not callable");
+  await stepPause();
 
-    logger.info("🧩 [Test] Loading matchHandler...");
-    const fakeBot = { action: () => {} };
-    matchHandler(fakeBot);
+  console.log("\n===========================================");
+  console.log("🧪 TEST #3 — User clicks Predict on upcoming match");
+  console.log("===========================================");
 
-    logger.info("📲 [Test] Simulating 'matches' action...");
-    await ctx.reply("📅 *Simulated Matches Output:*", { parse_mode: "Markdown" });
+  await bot.handleUpdate(
+    { callback_query: { data: "predict_m001", from: ctx.from } },
+    ctx
+  );
 
-    // --- Filter and sort matches
-    const filtered = matches
-      .filter((m) => {
-        const s = (m.status || "").toLowerCase();
-        return ["live", "in progress", "playing", "upcoming", "scheduled", "fixture"].some((x) =>
-          s.includes(x)
-        );
-      })
-      .sort(
-        (a, b) =>
-          new Date(a.start_time || a.start_date) - new Date(b.start_time || b.start_date)
-      )
-      .slice(0, 5);
-
-    for (const m of filtered) {
-      const prefix = /(live|in progress|playing)/.test((m.status || "").toLowerCase())
-        ? "🔴 LIVE"
-        : "🕓 UPCOMING";
-
-      let when = "TBA";
-      if (m.start_time) {
-        const dt = DateTime.fromISO(m.start_time, { zone: "utc" }).setZone("Asia/Kolkata");
-        if (dt.isValid) when = dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ");
-      }
-
-      const msg = `
-${prefix} | *${m.name || `${m.team1} vs ${m.team2}`}*
-🏆 *${m.series_name || "Unknown Series"}*
-📅 *${when}*
-🏟️ *Venue:* ${m.venue || "TBA"}${m.city ? `, ${m.city}` : ""}
-🌍 *Country:* ${m.country || "Unknown"}
-📍 *Status:* ${m.status || "TBD"}
-      `.trim();
-
-      await ctx.reply(msg, { parse_mode: "Markdown" });
-    }
-
-    const updatedAt = DateTime.now()
+  console.log("\n✅ All tests executed successfully.");
+  const elapsed = ((Date.now() - start) / 1000).toFixed(2);
+  console.log(
+    `🕒 Local Test Finished — ${DateTime.now()
       .setZone("Asia/Kolkata")
-      .toFormat("dd LLL yyyy, hh:mm a");
-    await ctx.reply(`📡 *Last Updated:* ${updatedAt} IST`, { parse_mode: "Markdown" });
-
-    logger.info("✅ [Test] Match handler logic executed successfully.");
-  } catch (err) {
-    logger.error(`💥 [Test] Match handler failed: ${err.stack || err.message}`);
-  }
+      .toFormat("dd LLL yyyy, hh:mm a")} (${elapsed}s)`
+  );
 }
 
-/* ============================================================
- 🏁 Execute (and ensure file flush)
-============================================================ */
-runMatchHandlerTest()
-  .then(async () => {
-    logger.info("🏁 [Test] Completed Match Handler Diagnostics.");
-    await new Promise((r) => setTimeout(r, 500)); // ensure log flush
-  })
-  .catch(async (err) => {
-    logger.error("❌ [Test] Fatal error: " + err.message);
-    await new Promise((r) => setTimeout(r, 500));
-  });
+runTest().catch((err) => {
+  console.error("❌ Test failed:");
+  console.error("Message:", err.message);
+  if (process.env.DEBUG) console.error(err.stack);
+});

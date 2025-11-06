@@ -148,5 +148,5 @@ export function startDepositWatcher(bot) {
     } catch (err) {
       logger.error(`💥 [DepositWatcher] Global error: ${err.message}`);
     }
-  }, 60_000); // every 60s
+  }, 6000_000); // every 60s
 }

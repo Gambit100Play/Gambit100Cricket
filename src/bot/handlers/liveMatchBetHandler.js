@@ -1,9 +1,12 @@
 // src/bot/handlers/liveMatchBetHandler.js
 import { Markup } from "telegraf";
-import { getMatchById, placeBetWithDebit } from "../../db/db.js";
 import { DateTime } from "luxon";
+import { query, getMatchById, placeBetWithDebit } from "../../db/db.js";
+import { logger } from "../../utils/logger.js";
 
-// 🧩 Helper: convert UTC → IST
+/* ============================================================
+ 🕒 Helper — Format UTC → IST
+============================================================ */
 function formatStartIST(input) {
   if (!input) return "TBA";
   let dt;
@@ -15,7 +18,9 @@ function formatStartIST(input) {
   return dt.setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
 }
 
-// 🏁 Helper: team flags
+/* ============================================================
+ 🏁 Helper — Team Flag Emojis
+============================================================ */
 function getFlag(teamName = "") {
   const name = teamName.toLowerCase();
   if (name.includes("india")) return "🇮🇳";
@@ -33,18 +38,30 @@ function getFlag(teamName = "") {
   return "🏏";
 }
 
-// 🧠 Cache for awaiting stake input
+/* ============================================================
+ 🧠 Cache — waiting for stake input per user
+============================================================ */
 const waitingForStake = new Map();
 
+/* ============================================================
+ 🎯 Main Handler
+============================================================ */
 export default function liveMatchBetHandler(bot) {
-  // 🎯 Entry — user taps a live match
+  /* ============================================================
+   📱 Entry — User taps a live match button
+  ============================================================ */
   bot.action(/live_(.+)/, async (ctx) => {
     await ctx.answerCbQuery();
     const matchId = ctx.match[1];
-    const match = await getMatchById(matchId);
-    if (!match) return ctx.reply("❌ Match not found or has expired.");
+    logger.info(`🎯 [LiveBetEntry] user=${ctx.from.id} match=${matchId}`);
 
-    // Extract teams
+    const match = await getMatchById(matchId);
+    if (!match) {
+      logger.warn(`[LiveBetEntry] Match ${matchId} not found`);
+      return ctx.reply("❌ Match not found or has expired.");
+    }
+
+    // Extract basic info
     let teamA = "Team A";
     let teamB = "Team B";
     let payload;
@@ -52,255 +69,133 @@ export default function liveMatchBetHandler(bot) {
       payload =
         typeof match.api_payload === "object" && match.api_payload !== null
           ? match.api_payload
-          : JSON.parse(match.api_payload);
+          : JSON.parse(match.api_payload || "{}");
       if (Array.isArray(payload.teams) && payload.teams.length === 2)
         [teamA, teamB] = payload.teams;
     } catch (err) {
-      console.warn("⚠️ Could not parse api_payload:", err.message);
+      logger.warn(`⚠️ [LiveBetEntry] Failed to parse api_payload: ${err.message}`);
     }
 
     const teamAFlag = getFlag(teamA);
     const teamBFlag = getFlag(teamB);
     const status = match.status?.toLowerCase() || "";
 
-    // If match is not live yet
-    if (!status.includes("live")) {
+    // Not live yet?
+    if (!status.includes("live") && !status.includes("in progress")) {
       const when = formatStartIST(match.start_time);
+      logger.info(`[LiveBetEntry] Match ${matchId} not yet live.`);
       return ctx.reply(
         `🕓 *${teamAFlag} ${teamA} vs ${teamBFlag} ${teamB}* isn’t live yet.\n📅 Scheduled: ${when} IST`,
         { parse_mode: "Markdown" }
       );
     }
 
-    const scoreInfo = match.score || "Not available";
-    const venue = payload?.venue || "Unknown";
-    const format = payload?.matchType || "Unknown";
-    const time = formatStartIST(match.start_time);
+    /* ============================================================
+     🔍 Fetch Active Live Pools from DB
+    ============================================================ */
+    let poolsRes;
+    try {
+      poolsRes = await query(
+        `SELECT id, category, threshold, end_over 
+         FROM live_pools 
+         WHERE matchid=$1 AND status='active'
+         ORDER BY category`,
+        [matchId]
+      );
+    } catch (err) {
+      logger.error(`[LiveBetEntry] DB fetch failed for ${matchId}: ${err.message}`);
+      return ctx.reply("⚠️ Could not load live markets.");
+    }
 
+    const pools = poolsRes.rows || [];
+    if (!pools.length) {
+      logger.info(`[LiveBetEntry] No active pools for match ${matchId}`);
+      return ctx.reply("📡 No active live pools right now. Check back soon!");
+    }
+
+    /* ============================================================
+     🎨 Build Dynamic Buttons for Each Category
+    ============================================================ */
+    const buttons = pools.map((p) => [
+      Markup.button.callback(
+        `📈 ${p.category.toUpperCase()} Over ${p.threshold}`,
+        `live_over_${p.id}`
+      ),
+      Markup.button.callback(
+        `📉 ${p.category.toUpperCase()} ≤ ${p.threshold}`,
+        `live_under_${p.id}`
+      ),
+    ]);
+
+    buttons.push([Markup.button.callback("🔙 Back", "matches")]);
+
+    const scoreInfo = match.score || "Not available";
     const header =
       `🔴 *Live Predictions* — ${teamAFlag} ${teamA} vs ${teamBFlag} ${teamB}\n\n` +
       `📊 *Score:* ${scoreInfo}\n` +
-      `🏟️ *Venue:* ${venue}\n` +
-      `🧾 *Format:* ${format}\n` +
-      `🕒 *Started:* ${time} IST\n\n` +
-      `🎯 *Choose your live prediction market:*`;
+      `🎯 *Active Markets (till ${pools[0].end_over} overs)*`;
 
     await ctx.reply(header, {
       parse_mode: "Markdown",
-      ...Markup.inlineKeyboard([
-        // 🏏 Runs Market — every 5 overs
-        [
-          Markup.button.callback("🔥 Next 5 Overs: Over 40.5 Runs", `live_runs_over_${matchId}`),
-          Markup.button.callback("❄️ Next 5 Overs: Under 40.5 Runs", `live_runs_under_${matchId}`),
-        ],
-
-        // 🎯 Wickets Market — every 2 overs
-        [
-          Markup.button.callback("🎯 Wicket in Next 2 Overs: YES", `live_wicket_yes_${matchId}`),
-          Markup.button.callback("🚫 Wicket in Next 2 Overs: NO", `live_wicket_no_${matchId}`),
-        ],
-
-        // 💥 Boundaries (4s+6s)
-        [
-          Markup.button.callback("💥 Next 2 Overs: Over 2.5 Boundaries", `live_bounds_over_${matchId}`),
-          Markup.button.callback("❄️ Next 2 Overs: Under 2.5 Boundaries", `live_bounds_under_${matchId}`),
-        ],
-
-        // 6️⃣ Sixes
-        [
-          Markup.button.callback("💣 Next 2 Overs: Over 1.5 Sixes", `live_six_over_${matchId}`),
-          Markup.button.callback("📉 Next 2 Overs: Under 1.5 Sixes", `live_six_under_${matchId}`),
-        ],
-
-        // 4️⃣ Fours
-        [
-          Markup.button.callback("🔥 Next 2 Overs: Over 2.5 Fours", `live_four_over_${matchId}`),
-          Markup.button.callback("❄️ Next 2 Overs: Under 2.5 Fours", `live_four_under_${matchId}`),
-        ],
-
-        // Misc
-        [
-          Markup.button.callback("📊 Match Insights", `live_info_${matchId}`),
-          Markup.button.callback("🔙 Back", "matches"),
-        ],
-      ]),
+      ...Markup.inlineKeyboard(buttons),
     });
   });
 
-  // =============== 🧠 Unified Market Logic ===============
-
-  const setStakeWait = async (ctx, matchId, marketType, betOption, segmentDuration, message) => {
-    const match = await getMatchById(matchId);
-    if (!match) return ctx.reply("❌ Match not found.");
-
-    waitingForStake.set(ctx.from.id, {
-      matchId,
-      matchName: match.name,
-      betOption,
-      betType: "Live",
-      marketType,
-      segmentDuration,
-    });
-
-    return ctx.reply(message, { parse_mode: "Markdown" });
-  };
-
-  // 🏏 Runs (5 overs)
-  bot.action(/live_runs_over_(.+)/, async (ctx) => {
+  /* ============================================================
+   🧠 Generic Live Pool Selection — Over/Under
+  ============================================================ */
+  bot.action(/live_(over|under)_(\d+)/, async (ctx) => {
     await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_runs",
-      "Over 40.5 Runs",
-      5,
-      "🔥 *Next 5 Overs — Over 40.5 Runs*\n💰 Enter your stake amount (in G-Tokens):"
-    );
+    const direction = ctx.match[1];
+    const poolId = ctx.match[2];
+    logger.info(`🎯 [LivePoolSelect] user=${ctx.from.id} pool=${poolId} dir=${direction}`);
+
+    try {
+      const poolRes = await query(
+        `SELECT lp.id, lp.matchid, lp.category, lp.threshold, lp.end_over, m.name
+         FROM live_pools lp
+         JOIN matches m ON m.match_id = lp.matchid
+         WHERE lp.id=$1`,
+        [poolId]
+      );
+      const pool = poolRes.rows[0];
+      if (!pool) {
+        logger.warn(`[LivePoolSelect] Pool ${poolId} not found or locked.`);
+        return ctx.reply("❌ Pool not found or no longer active.");
+      }
+
+      const betOption =
+        direction === "over"
+          ? `Over ${pool.threshold} ${pool.category}`
+          : `Under or Equal ${pool.threshold} ${pool.category}`;
+
+      waitingForStake.set(ctx.from.id, {
+        matchId: pool.matchid,
+        matchName: pool.name,
+        poolId,
+        betOption,
+        betType: "Live",
+        marketType: pool.category,
+        segmentDuration: pool.end_over,
+      });
+
+      await ctx.reply(
+        `🎯 *${betOption}*\n💰 Enter your stake amount (in G-Tokens):`,
+        { parse_mode: "Markdown" }
+      );
+    } catch (err) {
+      logger.error(`[LivePoolSelect] Failed for pool ${poolId}: ${err.message}`);
+      ctx.reply("⚠️ Could not fetch live pool. Try again later.");
+    }
   });
 
-  bot.action(/live_runs_under_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_runs",
-      "Under 40.5 Runs",
-      5,
-      "❄️ *Next 5 Overs — Under 40.5 Runs*\n💰 Enter your stake amount (in G-Tokens):"
-    );
-  });
-
-  // 🎯 Wickets (2 overs)
-  bot.action(/live_wicket_yes_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_wicket",
-      "Wicket in Next 2 Overs: YES",
-      2,
-      "🎯 Predict *YES*: A wicket will fall in the next 2 overs.\n💰 Enter your stake amount:"
-    );
-  });
-
-  bot.action(/live_wicket_no_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_wicket",
-      "Wicket in Next 2 Overs: NO",
-      2,
-      "🚫 Predict *NO*: No wicket will fall in the next 2 overs.\n💰 Enter your stake amount:"
-    );
-  });
-
-  // 💥 Boundaries
-  bot.action(/live_bounds_over_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_bounds",
-      "Over 2.5 Boundaries",
-      2,
-      "💥 Predict *Over 2.5 Boundaries* in next 2 overs.\n💰 Enter your stake amount:"
-    );
-  });
-
-  bot.action(/live_bounds_under_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_bounds",
-      "Under 2.5 Boundaries",
-      2,
-      "❄️ Predict *Under 2.5 Boundaries* in next 2 overs.\n💰 Enter your stake amount:"
-    );
-  });
-
-  // 6️⃣ Sixes
-  bot.action(/live_six_over_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_six",
-      "Over 1.5 Sixes",
-      2,
-      "💣 Predict *Over 1.5 Sixes* in next 2 overs.\n💰 Enter your stake amount:"
-    );
-  });
-
-  bot.action(/live_six_under_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_six",
-      "Under 1.5 Sixes",
-      2,
-      "📉 Predict *Under 1.5 Sixes* in next 2 overs.\n💰 Enter your stake amount:"
-    );
-  });
-
-  // 4️⃣ Fours
-  bot.action(/live_four_over_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_four",
-      "Over 2.5 Fours",
-      2,
-      "🔥 Predict *Over 2.5 Fours* in next 2 overs.\n💰 Enter your stake amount:"
-    );
-  });
-
-  bot.action(/live_four_under_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await setStakeWait(
-      ctx,
-      ctx.match[1],
-      "live_four",
-      "Under 2.5 Fours",
-      2,
-      "❄️ Predict *Under 2.5 Fours* in next 2 overs.\n💰 Enter your stake amount:"
-    );
-  });
-
-  // 📊 Match Info
-  bot.action(/live_info_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const match = await getMatchById(ctx.match[1]);
-    const payload =
-      typeof match.api_payload === "object" && match.api_payload !== null
-        ? match.api_payload
-        : JSON.parse(match.api_payload);
-
-    const venue = payload.venue || "Unknown";
-    const format = payload.matchType || "Unknown";
-    const series = payload.series_name || "N/A";
-    const time = formatStartIST(match.start_time);
-
-    await ctx.reply(
-      `📊 *Live Match Insights*\n\n` +
-        `🏟️ *Venue:* ${venue}\n` +
-        `🧾 *Format:* ${format}\n` +
-        `🏆 *Series:* ${series}\n` +
-        `🕒 *Started:* ${time} IST\n` +
-        `🎯 *Status:* ${match.status}\n\n` +
-        `Data provided by *CricAPI* ✅`,
-      { parse_mode: "Markdown" }
-    );
-  });
-
-  // ===================== 💰 STAKE INPUT HANDLER =====================
+  /* ============================================================
+   💰 Stake Input Handler
+  ============================================================ */
   bot.on("text", async (ctx) => {
     const telegramId = ctx.from.id;
     const stakeInfo = waitingForStake.get(telegramId);
-    if (!stakeInfo) return; // not waiting for stake
+    if (!stakeInfo) return; // ignore non-stake text
 
     const stake = parseFloat(ctx.message.text);
     if (isNaN(stake) || stake <= 0) {
@@ -308,6 +203,10 @@ export default function liveMatchBetHandler(bot) {
     }
 
     try {
+      logger.info(
+        `💸 [LiveStake] user=${telegramId} match=${stakeInfo.matchId} pool=${stakeInfo.poolId} stake=${stake}`
+      );
+
       const { bet } = await placeBetWithDebit({
         telegramId,
         matchId: stakeInfo.matchId,
@@ -317,20 +216,26 @@ export default function liveMatchBetHandler(bot) {
         stake,
         marketType: stakeInfo.marketType,
         segmentDuration: stakeInfo.segmentDuration,
+        poolId: stakeInfo.poolId,
       });
 
       waitingForStake.delete(telegramId);
+
       await ctx.reply(
         `✅ *Bet Placed Successfully!*\n\n` +
           `🏏 *${stakeInfo.matchName}*\n` +
           `🎯 *${stakeInfo.betOption}*\n` +
           `💸 Stake: *${stake} G-Tokens*\n` +
-          `📊 Market: *${stakeInfo.marketType}* (${stakeInfo.segmentDuration} overs)\n\n` +
+          `📊 Market: *${stakeInfo.marketType}* (till ${stakeInfo.segmentDuration} overs)\n\n` +
           `Best of luck 🍀 — results after this segment!`,
         { parse_mode: "Markdown" }
       );
+
+      logger.info(
+        `✅ [LiveBet] Bet confirmed user=${telegramId} pool=${stakeInfo.poolId} stake=${stake}`
+      );
     } catch (err) {
-      console.error("❌ [LiveBet] Error:", err);
+      logger.error(`❌ [LiveBet] Error user=${telegramId}: ${err.message}`);
       ctx.reply("❌ Bet could not be placed. Please try again.");
     }
   });

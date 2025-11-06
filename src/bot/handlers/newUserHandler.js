@@ -1,66 +1,74 @@
-// src/bot/handlers/newUserHandler.js
-import { Markup } from "telegraf";
-import { updateUser, getUserById } from "../../db/db.js";
+// =====================================================
+// 🧠 NEW USER HANDLER — Auto Registration + Deposit Wallet Creation
+// =====================================================
+import {
+  createOrUpdateUser,
+  getUserById,
+  updateUserActivity,
+  query,
+} from "../../db/db.js";
+import { logger } from "../../utils/logger.js";
+import { getOrCreateDepositAddress } from "../../utils/generateDepositAddress.js";
 
 export default function newUserHandler(bot) {
-  // Ask for phone number
-  bot.action("provide_phone", async (ctx) => {
-    await ctx.answerCbQuery();
-    ctx.reply("📱 Please send me your *phone number with country code* (e.g. +91XXXXXXXXXX):", {
-      parse_mode: "Markdown"
-    });
-    ctx.session.awaitingPhone = true;
-  });
-
-  // Capture phone number
-  bot.on("text", async (ctx, next) => {
-    const userId = ctx.from.id;
-    const user = await getUserById(userId);
-
-    if (ctx.session.awaitingPhone && /^\+\d{10,15}$/.test(ctx.message.text)) {
-      await updateUser(userId, { phone: ctx.message.text });
-      ctx.session.awaitingPhone = false;
-      return ctx.reply("✅ Phone number saved!\n\nNow please send your 📧 *email address*:", {
-        parse_mode: "Markdown"
-      });
-    }
-
-    if (ctx.session.awaitingEmail && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ctx.message.text)) {
-      await updateUser(userId, { email: ctx.message.text });
-      ctx.session.awaitingEmail = false;
-      return ctx.reply(
-        "✅ Email saved!\n\nNow, connect your wallet to unlock betting:",
-        Markup.inlineKeyboard([
-          [Markup.button.callback("🔗 Connect Wallet", "connect_wallet")]
-        ])
-      );
-    }
-
-    return next();
-  });
-
-  // When wallet connected (mocked for now)
-  bot.action("connect_wallet", async (ctx) => {
-    await ctx.answerCbQuery();
-    const userId = ctx.from.id;
-
-    // Update DB that wallet is connected
-    await updateUser(userId, { wallet_connected: true, status: "verified" });
-
-    ctx.reply("🔗 Wallet connected successfully!\n\n🎉 You can now place bets.");
-  });
-
-  // Block bet placement if user not verified
   bot.use(async (ctx, next) => {
-    const userId = ctx.from?.id;
-    if (!userId) return next();
+    try {
+      const telegramId = ctx.from?.id;
+      if (!telegramId) return next();
 
-    const user = await getUserById(userId);
-    if (user && user.status !== "verified") {
-      if (ctx.callbackQuery?.data?.startsWith("bet_")) {
-        return ctx.reply("⚠️ You must provide your phone, email, and connect wallet before placing bets.");
+      // 1️⃣ Create user if missing, else update activity
+      const user = await getUserById(telegramId);
+      if (!user) {
+        await createOrUpdateUser(
+          telegramId,
+          ctx.from?.username || null,
+          ctx.from?.first_name || "",
+          ctx.from?.last_name || ""
+        );
+        logger.info(
+          `👋 [NewUser] Registered new user ${telegramId} (${ctx.from?.username || "no username"})`
+        );
+      } else {
+        await updateUserActivity(telegramId);
       }
+
+      // 2️⃣ Ensure a deposit wallet exists
+      const walletInfo = await getOrCreateDepositAddress(telegramId);
+
+      // Defensive normalization for weird data (old JSON strings)
+      let address = walletInfo?.address;
+      if (typeof address !== "string") {
+        try {
+          const parsed = JSON.parse(address);
+          if (parsed?.address) address = parsed.address;
+        } catch {
+          // ignore parse errors; leave as-is
+        }
+      }
+
+      const derivationIndex = walletInfo?.derivationIndex;
+      if (!address || typeof address !== "string" || !address.startsWith("T")) {
+        throw new Error(`Invalid TRON address structure for user ${telegramId}: ${address}`);
+      }
+
+      // 3️⃣ Mirror the address into `users` (no redundant wallet insert)
+      await query(
+        `UPDATE users
+           SET deposit_address = $1,
+               last_active = NOW()
+         WHERE telegram_id = $2
+           AND (deposit_address IS NULL OR deposit_address != $1)`,
+        [address, telegramId]
+      );
+
+      logger.info(
+        `💰 [NewUser] Deposit address ensured for ${telegramId}: ${address} (index=${derivationIndex})`
+      );
+
+      await next();
+    } catch (err) {
+      logger.error(`❌ [NewUserHandler] ${err.message}`);
+      await next();
     }
-    return next();
   });
 }

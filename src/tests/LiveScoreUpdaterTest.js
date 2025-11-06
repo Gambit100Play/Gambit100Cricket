@@ -1,20 +1,26 @@
-// src/tests/LiveScoreUpdaterTest.js
+// ============================================================
+// 🏏 Live Score Updater — Manual Trigger Edition (v2.0)
+// ============================================================
+
 import https from "https";
 import dotenv from "dotenv";
 import { DateTime } from "luxon";
 import { query } from "../db/db.js";
+import { fileURLToPath } from "url";
+import { basename } from "path";
 
 dotenv.config();
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 
-/**
- * Fetch and display (or update DB) the live “overs” data for a specific match ID.
- * Uses actual Cricbuzz structure verified from API.
- */
-export default async function fetchLiveScoresEveryTwoOvers(matchId) {
+// ============================================================
+// 🧠 Core Function — Fetch Live Scores
+// ============================================================
+export async function fetchLiveScoresEveryTwoOvers(matchId) {
   if (!matchId) throw new Error("❌ No matchId provided");
 
-  const now = DateTime.now().setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
+  const now = DateTime.now()
+    .setZone("Asia/Kolkata")
+    .toFormat("dd LLL yyyy, hh:mm a");
   console.log(`\n🕓 ${now} - 🏏 Fetching live 2-over update for Match ID: ${matchId}`);
 
   const path = `/mcenter/v1/${matchId}/overs`;
@@ -29,9 +35,7 @@ export default async function fetchLiveScoresEveryTwoOvers(matchId) {
     const mini = data.miniscore;
     const head = data.matchheaders || {};
 
-    // ===============================
     // 🧩 Extract Core Fields
-    // ===============================
     const batTeam = head.teamdetails?.batteamname || "Unknown Team";
     const bowlTeam = head.teamdetails?.bowlteamname || "Unknown Opponent";
     const format = head.matchformat || "Unknown Format";
@@ -43,21 +47,19 @@ export default async function fetchLiveScoresEveryTwoOvers(matchId) {
     const rrr = mini.rrr ?? "-";
     const status = head.status || mini.custstatus || "—";
 
-    // 🎯 Striker / Non-Striker / Bowler
+    // 🎯 Player info
     const striker = mini.batsmanstriker?.name || "—";
     const strikerRuns = mini.batsmanstriker?.runs || 0;
     const strikerBalls = mini.batsmanstriker?.balls || 0;
-
     const nonStriker = mini.batsmannonstriker?.name || "—";
     const nonStrikerRuns = mini.batsmannonstriker?.runs || 0;
     const nonStrikerBalls = mini.batsmannonstriker?.balls || 0;
-
     const bowler = mini.bowlerstriker?.name || "—";
     const bowlerWkts = mini.bowlerstriker?.wickets || 0;
     const bowlerRuns = mini.bowlerstriker?.runs || 0;
     const bowlerOvers = mini.bowlerstriker?.overs || "0";
 
-    // 🕒 Recent Overs — 2 latest
+    // 🕒 Recent Overs
     const oversList = data.overseplist?.oversep || [];
     const recentOvers = oversList.slice(0, 2);
     const recentSummary = recentOvers
@@ -67,22 +69,22 @@ export default async function fetchLiveScoresEveryTwoOvers(matchId) {
       )
       .join(" || ");
 
-    // ===============================
-    // 🧾 Build Final Summary
-    // ===============================
+    // 🧾 Final Summary
     const summary = `[${batTeam}] ${runs}/${wkts} in ${overs} overs | CRR: ${crr} | RRR: ${rrr}`;
 
     console.log(`📊 ${summary}`);
     console.log(`🏏 Format: ${format}`);
-    console.log(`👥 Batting: ${striker} (${strikerRuns} off ${strikerBalls}) & ${nonStriker} (${nonStrikerRuns} off ${nonStrikerBalls})`);
-    console.log(`🎯 Bowling: ${bowler} - ${bowlerWkts}/${bowlerRuns} in ${bowlerOvers} ov`);
+    console.log(
+      `👥 Batting: ${striker} (${strikerRuns} off ${strikerBalls}) & ${nonStriker} (${nonStrikerRuns} off ${nonStrikerBalls})`
+    );
+    console.log(
+      `🎯 Bowling: ${bowler} - ${bowlerWkts}/${bowlerRuns} in ${bowlerOvers} ov`
+    );
     if (recentSummary) console.log(`🕒 Last 2 Overs → ${recentSummary}`);
     console.log(`🧾 Status: ${status}`);
     console.log("──────────────────────────────────────────────");
 
-    // =========================================================
-    // 💾 Database update (only if data is valid)
-    // =========================================================
+    // 💾 Update DB only if innings has started
     if (runs === 0 && wkts === 0 && overs === 0) {
       console.log("ℹ️ [DB] Skipped update — innings not started yet.");
       return;
@@ -100,9 +102,9 @@ export default async function fetchLiveScoresEveryTwoOvers(matchId) {
   }
 }
 
-// =============================================================
+// ============================================================
 // 🔒 Safe HTTPS fetcher
-// =============================================================
+// ============================================================
 async function fetchFromCricbuzz(path) {
   const options = {
     method: "GET",
@@ -127,7 +129,7 @@ async function fetchFromCricbuzz(path) {
           resolve(JSON.parse(data));
         } catch (err) {
           console.error("❌ JSON parse error:", err.message);
-          console.log("🔍 Snippet:", data.slice(0, 400));
+          console.log("🔍 Snippet:", data.slice(0, 300));
           resolve(null);
         }
       });
@@ -140,14 +142,25 @@ async function fetchFromCricbuzz(path) {
   });
 }
 
-// =============================================================
-// 🚀 Manual Test Runner (ESM safe)
-// =============================================================
-import { fileURLToPath } from "url";
-import { basename } from "path";
+// ============================================================
+// 🚀 Manual CLI Runner (optional trigger)
+// ============================================================
 const __filename = fileURLToPath(import.meta.url);
-
 if (basename(__filename) === "LiveScoreUpdaterTest.js") {
-  console.log("🚀 Manual Test: Running Live Score Updater...\n");
-  await fetchLiveScoresEveryTwoOvers("135255"); // ✅ Example: UAE vs USA
+  const args = process.argv.slice(2);
+  const matchIdArg = args[1] || args[0];
+
+  if (args[0] === "--run" && matchIdArg) {
+    console.log(`🚀 Manual Run Requested → Match ID: ${matchIdArg}`);
+    await fetchLiveScoresEveryTwoOvers(matchIdArg);
+  } else {
+    console.log(`
+🧪 LiveScoreUpdaterTest loaded successfully.
+Usage:
+  node src/tests/LiveScoreUpdaterTest.js --run <matchId>
+
+Example:
+  node src/tests/LiveScoreUpdaterTest.js --run 135255
+    `);
+  }
 }

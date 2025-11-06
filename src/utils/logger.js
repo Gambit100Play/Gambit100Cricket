@@ -30,12 +30,14 @@ export function logToFile(message, type = "INFO") {
  */
 export const logger = {
   info: (msg) => {
-    console.log(msg); // keep console color
-    logToFile(msg, "INFO");
+    const formatted = typeof msg === "string" ? msg : JSON.stringify(msg, null, 2);
+    console.log(formatted); // keep console color
+    logToFile(formatted, "INFO");
   },
   warn: (msg) => {
-    console.warn(msg);
-    logToFile(msg, "WARN");
+    const formatted = typeof msg === "string" ? msg : JSON.stringify(msg, null, 2);
+    console.warn(formatted);
+    logToFile(formatted, "WARN");
   },
   error: (msg) => {
     console.error(msg);
@@ -43,9 +45,10 @@ export const logger = {
     logToFile(formatted, "ERROR");
   },
   debug: (msg) => {
+    const formatted = typeof msg === "string" ? msg : JSON.stringify(msg, null, 2);
     if (process.env.NODE_ENV !== "production") {
-      console.debug(msg);
+      console.debug(formatted);
     }
-    logToFile(msg, "DEBUG");
+    logToFile(formatted, "DEBUG");
   },
 };

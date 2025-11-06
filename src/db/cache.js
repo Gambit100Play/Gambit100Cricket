@@ -1,4 +1,4 @@
-import redis from "../utils/redisClient.js";
+// import redis from "../utils/redisClient.js";
 
 // ✅ Cache balance
 export async function cacheUserBalance(telegramId, balance) {

@@ -1,17 +1,12 @@
-import dotenv from "dotenv";
-import { createBot } from "./bot/bot.js";
+import bot from "./bot/bot.js";
+import { logger } from "./utils/logger.js";
 
-dotenv.config();
-
-const token = process.env.BOT_TOKEN;
-if (!token) throw new Error("❌ BOT_TOKEN missing in .env file");
-
-const bot = createBot(token);
-
-bot.launch()
-  .then(() => console.log("🚀 Bot launched successfully and is polling for updates..."))
-  .catch((err) => console.error("❌ Bot launch failed:", err));
-
-// Graceful shutdown
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+(async () => {
+  try {
+    await bot.launch();
+    logger.info("🚀 Bot launched successfully and is polling for updates...");
+  } catch (err) {
+    logger.error(`❌ Bot launch failed: ${err.message}`);
+    process.exit(1);
+  }
+})();

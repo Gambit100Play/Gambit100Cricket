@@ -13,7 +13,13 @@
         },
         "waitingForWallet": false,
         "playFlow": null,
-        "awaitingWalletAddress": false
+        "awaitingWalletAddress": false,
+        "currentPlay": {
+          "matchId": "m-136348",
+          "marketType": "PreMatch",
+          "playOption": "Under 300 Runs",
+          "matchName": "Boland vs Titans"
+        }
       }
     },
     {

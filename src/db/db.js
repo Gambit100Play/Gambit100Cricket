@@ -24,6 +24,46 @@ console.log("Connected to PostgreSQL");
 export async function query(text, params) {
   return pool.query(text, params);
 }
+// 👉 assumes you already export a `query` (pg Pool) somewhere
+//    and your table is named `matches` with id, status, result, winner, updated_at, completed_at.
+
+export async function getUncompletedMatches(limit = 50) {
+  const sql = `
+    SELECT id AS match_id, team1, team2
+    FROM matches
+    WHERE status NOT IN ('completed', 'no result', 'abandoned', 'cancelled', 'canceled')
+       OR status IS NULL
+    ORDER BY updated_at NULLS FIRST
+    LIMIT $1
+  `;
+  const { rows } = await query(sql, [limit]);
+  return rows; // [{ match_id, team1, team2 }]
+}
+
+export async function markMatchCompletedDb(matchId, { resultText = null, winner = null } = {}) {
+  const sql = `
+    UPDATE matches
+       SET status = 'completed',
+           result = COALESCE($2, result),
+           winner = COALESCE($3, winner),
+           completed_at = NOW(),
+           updated_at = NOW()
+     WHERE id = $1
+  `;
+  await query(sql, [matchId, resultText, winner]);
+  return true;
+}
+export async function insertUserBet(userId, matchId, marketType, playOption, stake) {
+  return placeBetWithDebit({
+    telegramId: userId,
+    matchId,
+    matchName: matchId,
+    betType: "Fixed",
+    betOption: playOption,
+    stake,
+    marketType,
+  });
+}
 
 // =====================================================
 // 👤 USERS (Registration, Activity & Wallet Info)
@@ -223,31 +263,82 @@ export async function saveMatches(matches = []) {
 }
 
 
-// Lock pool + store hash + txid
 export async function lockMatchPool(matchId, hash, txid) {
   try {
+    // 1️⃣ Lock the pool in `pools` table
     await query(
-      `UPDATE pools
-       SET status = 'locked',
-           lock_hash = $1,
-           tron_txid = $2,
-           locked_at = NOW(),
-           updated_at = NOW()
-       WHERE matchid = $3`,
+      `
+      UPDATE pools
+      SET 
+        status = 'locked_pre',
+        lock_hash = $1,
+        tron_txid = $2,
+        locked_at = NOW(),
+        updated_at = NOW()
+      WHERE matchid = $3 
+        AND LOWER(pool_type) = 'prematch'
+        AND (status = 'active' OR status = 'pending')
+      `,
       [hash, txid, matchId]
     );
-    console.log(`✅ [DB] Pool locked for match ${matchId}`);
+
+    // 2️⃣ Reflect the same lock in `matches` table
+    await query(
+      `
+      UPDATE matches
+      SET 
+        prematch_locked = TRUE,
+        prematch_locked_at = NOW(),
+        pool_hash = $1,
+        tron_txid = $2,
+        status = 'locked_pre'
+      WHERE match_id = $3
+      `,
+      [hash, txid, matchId]
+    );
+
+    console.log(`✅ [DB] Pre-match pool locked for match ${matchId}`);
   } catch (err) {
-    console.error(`❌ [DB] lockMatchPool failed for ${matchId}:`, err.message);
+    console.error(`❌ [DB] lockMatchPool failed for ${matchId}: ${err.message}`);
   }
 }
 
+
+
 // Fetch matches still in pre-match phase
 export async function getPendingPrematchMatches() {
-  return query(
-    "SELECT * FROM matches WHERE status = 'PRE_MATCH' AND pool_locked = false"
-  );
+  const sql = `
+    SELECT 
+      m.match_id,
+      m.team1,
+      m.team2,
+      m.series_name,
+      m.match_desc,
+      m.prematch_locked,
+      m.prematch_locked_at,
+      m.toss_detected_at,
+      m.pool_hash,
+      m.tron_txid
+    FROM matches m
+    JOIN pools p ON p.matchid = m.match_id
+    WHERE LOWER(p.pool_type) = 'prematch'
+      AND LOWER(p.status) IN ('active', 'pending')
+      AND (m.status ILIKE 'upcoming' OR m.status ILIKE 'pre_match')
+      AND (m.prematch_locked = FALSE OR m.prematch_locked IS NULL)
+      AND (m.prematch_locked_at IS NULL)
+  `;
+
+  try {
+    const res = await query(sql);
+    return res.rows || [];
+  } catch (err) {
+    console.error(`❌ [getPendingPrematchMatches] Failed: ${err.message}`);
+    return [];
+  }
 }
+
+
+
 
 export async function saveMatch(match) {
   try {
@@ -478,6 +569,9 @@ export async function getPoolSummary(matchId, marketType = "PreMatch") {
 // =====================================================
 // ❌ CANCEL USER BET (Transactional)
 // =====================================================
+// =====================================================
+// ❌ CANCEL USER BET (Transactional + Pool Update)
+// =====================================================
 export async function cancelUserBet(telegramId, playIndex) {
   const client = await pool.connect();
   try {
@@ -486,7 +580,7 @@ export async function cancelUserBet(telegramId, playIndex) {
 
     // 1️⃣ Fetch all bets for this user ordered consistently
     const { rows: bets } = await client.query(
-      `SELECT id, stake, status 
+      `SELECT id, match_id, stake, status 
          FROM bets 
         WHERE telegram_id = $1 
         ORDER BY created_at DESC`,
@@ -532,7 +626,7 @@ export async function cancelUserBet(telegramId, playIndex) {
     const balance = balances[0];
     const newTokens = Number(balance.tokens) + Number(bet.stake);
 
-    // 3️⃣ Update balance + bet atomically
+    // 3️⃣ Update balance + mark bet as cancelled
     await client.query(
       `UPDATE balances
           SET tokens = $2
@@ -555,10 +649,27 @@ export async function cancelUserBet(telegramId, playIndex) {
       return { success: false, error: "NO_UPDATE" };
     }
 
+    // 4️⃣ Update pool total_stake to reflect cancelled bet
+    await client.query(
+      `
+      UPDATE pools
+         SET total_stake = GREATEST(total_stake - $1, 0),
+             updated_at = NOW()
+       WHERE matchid = $2 AND LOWER(pool_type) = 'prematch'
+      `,
+      [bet.stake, bet.match_id]
+    );
+
+    // 5️⃣ Commit
     await client.query("COMMIT");
 
     console.log(
-      `✅ [DB] Cancelled bet ${bet.id} for ${telegramId} | refunded=${bet.stake} | newTokens=${newTokens}`
+      `✅ [DB] Cancelled bet ${bet.id} | refunded=${bet.stake} | newTokens=${newTokens}`
+    );
+
+    // 6️⃣ Trigger odds recalculation asynchronously (non-blocking)
+    refreshPoolOdds(bet.match_id, "PreMatch").catch((err) =>
+      console.warn(`⚠️ [OddsRefresh] Failed post-cancel: ${err.message}`)
     );
 
     return {
@@ -575,6 +686,40 @@ export async function cancelUserBet(telegramId, playIndex) {
     client.release();
   }
 }
+/**
+ * ♻️ Recompute and refresh pool odds after bet cancellation
+ */
+async function refreshPoolOdds(matchId, marketType = "PreMatch") {
+  try {
+    const res = await pool.query(
+      `
+      UPDATE pools p
+         SET total_stake = sub.total_stake,
+             updated_at = NOW()
+        FROM (
+          SELECT match_id, SUM(stake) AS total_stake
+            FROM bets
+           WHERE status NOT IN ('Cancelled', 'cancelled')
+             AND match_id = $1
+             AND LOWER(market_type) = LOWER($2)
+           GROUP BY match_id
+        ) sub
+       WHERE p.matchid = sub.match_id
+         AND LOWER(p.pool_type) = LOWER($2)
+      `,
+      [matchId, marketType]
+    );
+
+    if (res.rowCount > 0) {
+      console.log(`♻️ [DB] Pool odds recalculated for ${matchId} (${marketType})`);
+    } else {
+      console.log(`ℹ️ [DB] No pool updated for ${matchId} (${marketType})`);
+    }
+  } catch (err) {
+    console.error(`❌ [DB] refreshPoolOdds failed for ${matchId}:`, err.message);
+  }
+}
+
 
 // =====================================================
 // ⚖️ DYNAMIC ODDS + POOL SUMMARY (Updated for Real Team Names)

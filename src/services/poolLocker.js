@@ -2,7 +2,7 @@
 import { query } from "../db/db.js";
 import { getPoolInfo } from "../db/poolLogic.js";
 import { canonicalStringify, sha256Hex } from "../utils/canonical.js";
-import { publishHashMemo } from "../utils/tron.js"; // ⬅️ implement this in utils/tron.js
+import { publishHashToTron } from "../utils/tronPublisher.js";
 import { DateTime } from "luxon";
 
 /**
@@ -142,7 +142,7 @@ export async function lockPreMatchPool(matchId) {
     const { snapshot, hashHex } = await buildPreMatchSnapshot(c, matchId);
 
     // Publish hash to Tron blockchain
-    const tronTxId = await publishHashMemo(hashHex, "PreMatch Pool Lock");
+    const tronTxId = await publishHashToTron(hashHex);
 
     // Save results
     await persistLock(c, matchId, snapshot, hashHex, tronTxId);

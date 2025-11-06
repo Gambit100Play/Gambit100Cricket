@@ -1,5 +1,8 @@
+//src/bot/handlers/walletHandler.js
+
 import { Markup } from "telegraf";
-import { getOrCreateDepositAddress } from "./generateDepositAddress.js";
+import { getOrCreateDepositAddress } from "../../utils/generateDepositAddress.js";
+import { handleWalletLinkFlow, processWalletAddress } from "./connectWalletHandler.js";
 import { logger } from "../../utils/logger.js";
 import pkg from "pg";
 const { Pool } = pkg;
@@ -49,7 +52,7 @@ async function getUserWalletAddress(telegramId) {
 }
 
 // ──────────────────────────────────────────────
-// 🎛 Main Wallet Handler
+// 🎛 Main Wallet Handler (Telegram UI Layer)
 // ──────────────────────────────────────────────
 export default function walletHandler(bot) {
   // 💼 Wallet Menu
@@ -78,7 +81,7 @@ export default function walletHandler(bot) {
     }
   });
 
-  // 📥 Generate Deposit Wallet
+  // 📥 Generate Deposit Wallet (custodial)
   bot.action("connect_wallet", async (ctx) => {
     await ctx.answerCbQuery();
     const telegramId = String(ctx.from.id);
@@ -109,65 +112,15 @@ export default function walletHandler(bot) {
     }
   });
 
-  // 🔗 Connect Own Wallet — now session-based and reliable
+  // 🔗 Connect Own Wallet — delegated to connectWalletHandler.js
   bot.action("link_withdraw_wallet", async (ctx) => {
     await ctx.answerCbQuery();
-    const telegramId = ctx.from.id;
-    logger.info(`🔗 [WalletHandler] connect your own wallet triggered for ${telegramId}`);
-
-    // mark in session that we expect the next message to be a wallet address
-    ctx.session.awaitingWalletAddress = true;
-
-    await ctx.reply(
-      "🔗 *Please send me your TRON wallet address* (must start with `T`).\n\n" +
-        "Example: `TDQuVs7y1wckGmXBssjFvFkoui18qj2RmB`\n\n" +
-        "Once sent, it’ll be linked to your account for withdrawals.",
-      { parse_mode: "Markdown" }
-    );
+    await handleWalletLinkFlow(ctx); // delegate flow start
   });
 
-  // 🧩 Handle text input for wallet linking
+  // 🧩 Handle text input for wallet linking — delegated to connectWalletHandler.js
   bot.on("text", async (ctx) => {
-    if (!ctx.session?.awaitingWalletAddress) return; // ignore if not expecting address
-
-    const telegramId = String(ctx.from.id);
-    const walletAddr = ctx.message.text.trim();
-    ctx.session.awaitingWalletAddress = false; // reset state
-
-    if (!/^T[a-zA-Z0-9]{33}$/.test(walletAddr)) {
-      await ctx.reply("⚠️ Invalid TRON address format. Please try again.", {
-        parse_mode: "Markdown",
-        ...walletMenu(),
-      });
-      return;
-    }
-
-    const client = await pool.connect();
-    try {
-      await client.query(
-        `UPDATE user_wallets
-         SET user_wallet_address = $1
-         WHERE telegram_id = $2`,
-        [walletAddr, telegramId]
-      );
-
-      await ctx.reply(
-        `✅ *Wallet Linked Successfully!*\n\n` +
-          `Your withdrawal wallet:\n\`${walletAddr}\`\n\n` +
-          `You can change it anytime by tapping *Connect Your Own Wallet* again.`,
-        { parse_mode: "Markdown", ...walletMenu() }
-      );
-
-      logger.info(`✅ [WalletHandler] Linked wallet for ${telegramId}: ${walletAddr}`);
-    } catch (err) {
-      logger.error(`⚠️ [WalletHandler] Wallet linking failed for ${telegramId}: ${err.message}`);
-      await ctx.reply("⚠️ Could not save your wallet. Try again later.", {
-        parse_mode: "Markdown",
-        ...walletMenu(),
-      });
-    } finally {
-      client.release();
-    }
+    await processWalletAddress(ctx, pool);
   });
 
   // 💰 Check Balance

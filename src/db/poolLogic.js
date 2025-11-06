@@ -1,11 +1,15 @@
+// src/db/poolLogic.js
 import { query } from "./db.js";
+import { logger } from "../utils/logger.js";
 
 /**
- * 🔍 Aggregate pool info dynamically from bets table
- * Handles:
- *   - Specific bet option
- *   - Full pool (all bet options)
- *   - Dynamic activation based on unique plays OR total stake
+ * ============================================================
+ * 🔍 getPoolInfo()
+ * Aggregates pool data from bets table.
+ *  - Supports: full pool or single bet option
+ *  - Computes participants, total stake, unique plays
+ *  - Dynamically marks pool as 'active' or 'pending'
+ * ============================================================
  */
 export async function getPoolInfo(
   matchId,
@@ -13,26 +17,28 @@ export async function getPoolInfo(
   betOption = null,
   minNeeded = 10
 ) {
+  const matchIdText = String(matchId).trim();
+  const poolTypeClean = poolType.replace(/\s+/g, "").toLowerCase();
+
+  logger.info(`🎯 [getPoolInfo] match=${matchIdText}, poolType=${poolTypeClean}, betOption=${betOption || "ALL"}`);
+
   try {
-    const matchIdText = String(matchId).trim();
-    const poolTypeClean = poolType.replace(/\s+/g, "").toLowerCase();
-
-    // -------------------------------
-    // 🎯 CASE 1 — Single bet option
-    // -------------------------------
+    // ============================================================
+    // CASE 1 — Single bet option
+    // ============================================================
     if (betOption) {
-      const res = await query(
-        `SELECT 
-           COUNT(DISTINCT telegram_id) AS participants,
-           COALESCE(SUM(stake), 0) AS total_stake
-         FROM bets
-         WHERE TRIM(match_id)::text = $1
-           AND REPLACE(LOWER(market_type), ' ', '') = $2
-           AND LOWER(TRIM(bet_option)) = LOWER(TRIM($3))`,
-        [matchIdText, poolTypeClean, betOption]
-      );
-
+      const sql = `
+        SELECT 
+          COUNT(DISTINCT telegram_id) AS participants,
+          COALESCE(SUM(stake), 0) AS total_stake
+        FROM bets
+        WHERE TRIM(match_id)::text = $1
+          AND REPLACE(LOWER(market_type), ' ', '') = $2
+          AND LOWER(TRIM(bet_option)) = LOWER(TRIM($3))
+      `;
+      const res = await query(sql, [matchIdText, poolTypeClean, betOption]);
       const row = res.rows[0] || { participants: 0, total_stake: 0 };
+
       const participants = Number(row.participants || 0);
       const totalStake = Number(row.total_stake || 0);
       const status = participants >= minNeeded ? "active" : "pending";
@@ -40,6 +46,10 @@ export async function getPoolInfo(
       const progressBlocks = Math.floor((participants / minNeeded) * 10);
       const progressBar =
         "▓".repeat(progressBlocks) + "░".repeat(10 - progressBlocks);
+
+      logger.info(
+        `📊 [getPoolInfo:Single] ${betOption}: ${participants} players, ${totalStake} G staked, status=${status}`
+      );
 
       return {
         rows: [row],
@@ -52,10 +62,11 @@ export async function getPoolInfo(
       };
     }
 
-    // -------------------------------
-    // 🎯 CASE 2 — Full match pool
-    // -------------------------------
-    const [playersRes, distinctRes, stakeRes] = await Promise.all([
+    // ============================================================
+    // CASE 2 — Full match pool aggregation
+    // ============================================================
+
+    const [playersRes, playsRes, stakesRes] = await Promise.all([
       query(
         `SELECT COUNT(DISTINCT telegram_id) AS unique_players
          FROM bets
@@ -85,12 +96,10 @@ export async function getPoolInfo(
     ]);
 
     const uniquePlayers = Number(playersRes.rows[0]?.unique_players || 0);
-    const uniquePlays = Number(distinctRes.rows[0]?.unique_plays || 0);
-    let rows = stakeRes.rows || [];
+    const uniquePlays = Number(playsRes.rows[0]?.unique_plays || 0);
+    let rows = stakesRes.rows || [];
 
-    // -------------------------------
-    // 🧩 Always include default options
-    // -------------------------------
+    // Always include default bet options to keep the pool consistent
     const defaultOptions = [
       "Team A to Win",
       "Team B to Win",
@@ -107,7 +116,7 @@ export async function getPoolInfo(
       }
     }
 
-    // 🧹 De-duplicate and preserve only one record per key
+    // De-duplicate
     const seen = new Set();
     rows = rows.filter((r) => {
       const k = r.key.toLowerCase();
@@ -116,15 +125,13 @@ export async function getPoolInfo(
       return true;
     });
 
-    // 🧮 Order the rows logically
+    // Order logically
     const order = new Map(defaultOptions.map((opt, i) => [opt.toLowerCase(), i]));
     rows.sort((a, b) => (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999));
 
-    // -------------------------------
-    // ⚙️ Compute pool status
-    // -------------------------------
+    // Compute overall totals
     const totalStake = rows.reduce((a, r) => a + Number(r.total_stake || 0), 0);
-    const minStakeThreshold = 100; // activate if total >= 100 G
+    const minStakeThreshold = 100; // activate if total ≥ 100 G
     const minUniquePlays = 3;
 
     const status =
@@ -137,9 +144,10 @@ export async function getPoolInfo(
     const progressBar =
       "▓".repeat(progressBlocks) + "░".repeat(10 - progressBlocks);
 
-    // -------------------------------
-    // 🧾 Return aggregated data
-    // -------------------------------
+    logger.info(
+      `🏊 [getPoolInfo:Full] ${uniquePlayers} players | ${uniquePlays} plays | ${totalStake}G staked | status=${status}`
+    );
+
     return {
       rows,
       participants: uniquePlayers,
@@ -151,7 +159,7 @@ export async function getPoolInfo(
       progressBar,
     };
   } catch (err) {
-    console.error("❌ [DB] getPoolInfo error:", err.message);
+    logger.error(`❌ [getPoolInfo] Failed for match ${matchId}: ${err.message}`);
     return {
       rows: [],
       participants: 0,
@@ -166,8 +174,13 @@ export async function getPoolInfo(
 }
 
 /**
- * 🧮 Pool status helper
+ * ============================================================
+ * 🧮 getPoolStatus()
+ * Simple helper to decide pool readiness
+ * ============================================================
  */
 export function getPoolStatus(participants, minNeeded = 10) {
-  return participants >= minNeeded ? "active" : "pending";
+  const status = participants >= minNeeded ? "active" : "pending";
+  logger.debug(`⚙️ [getPoolStatus] participants=${participants}, status=${status}`);
+  return status;
 }

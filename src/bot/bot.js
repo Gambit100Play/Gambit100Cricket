@@ -1,194 +1,153 @@
 // =====================================================
-// 🏏 CricPredict — Telegram Bot Bootstrap (Final Version)
+// 🤖 TELEGRAM BOT — SINGLE ENTRY POINT (Stable Production-Ready Version)
 // =====================================================
+import dotenv from "dotenv";
 import { Telegraf } from "telegraf";
 import LocalSession from "telegraf-session-local";
-import dotenv from "dotenv";
-dotenv.config();
-
-// ---------------- Logger ----------------
 import { logger } from "../utils/logger.js";
 
-// ---------------- Handler Imports ----------------
+// =====================================================
+// 📅 Import cron jobs (only those that self-schedule safely)
+// =====================================================
+import "../cron/PreMatchBetLockCron.js";
+import "../cron/LiveMatchPoolGeneratorCron.js";
+import "../cron/liveScoreUpdaterCron.js";
+import "../cron/LockMatchCron.js";
+import "../cron/flushBets.js";
+
+// 🟠 Explicit start crons
+import { startCleanupCron } from "../cron/cleanupMatchesCron.js";
+import "../cron/fetchMatchesCron.js";
+
+// =====================================================
+// 🤖 Import Bot Handlers
+// =====================================================
 import startHandler from "./handlers/startHandler.js";
-import walletHandler from "./handlers/walletHandler.js"; // ✅ Unified wallet handler
-import betHandler from "./handlers/betHandler.js";
+import helpHandler from "./handlers/helpHandler.js";
+import howToPlayHandler from "./handlers/howToPlayHandler.js";
 import matchHandler from "./handlers/matchHandler.js";
 import preMatchBetHandler from "./handlers/preMatchBetHandler.js";
 import liveMatchBetHandler from "./handlers/liveMatchBetHandler.js";
-import helpHandler from "./handlers/helpHandler.js";
-import howToPlayHandler from "./handlers/howToPlayHandler.js";
 import myBetsHandler from "./handlers/myBetsHandler.js";
-import cancelBetHandler from "./handlers/cancelBetHandler.js"; // ✅ loaded AFTER myBetsHandler
-import connectWalletHandler from "./handlers/connectWalletHandler.js";
+import betHandler from "./handlers/betHandler.js";
+import cancelBetHandler from "./handlers/cancelBetHandler.js";
+import walletHandler from "./handlers/walletHandler.js";
+import checkBalanceHandler from "./handlers/checkBalanceHandler.js";
+import newUserHandler from "./handlers/newUserHandler.js";
 
-// ---------------- Background Jobs ----------------
-import { startDepositWatcher } from "../cron/depositWatcher.js";
-import "../cron/cleanupMatchesCron.js";
-import "../cron/markCompletedMatches.js";
-import "../cron/liveScoreUpdaterCron.js";
-import "../cron/fetchMatchesCron.js";
-import "../cron/fetchUpcomingCron.js";
+// 🔗 Named imports for wallet linking
+import { handleWalletLinkFlow, processWalletAddress } from "./handlers/connectWalletHandler.js";
+
+// Not a handler — utility
+import { getOrCreateDepositAddress } from "../utils/generateDepositAddress.js";
 
 // =====================================================
-// 🧩 BOT CREATOR FUNCTION
+// 🔐 Environment setup & validation
 // =====================================================
-export function createBot(token) {
-  if (!token) throw new Error("❌ BOT_TOKEN missing or invalid.");
+dotenv.config();
+const token = process.env.BOT_TOKEN;
 
-  const bot = new Telegraf(token);
-  logger.info("🚀 [Bot] Initializing CricPredict bot...");
-
-  // =====================================================
-  // 🧱 Global Error Management
-  // =====================================================
-  process.on("unhandledRejection", (reason) =>
-    logger.error(`⚠️ Unhandled Rejection: ${reason}`)
-  );
-  process.on("uncaughtException", (err) =>
-    logger.error(`💥 Uncaught Exception: ${err.message}\n${err.stack}`)
-  );
-
-  // Gracefully handle stale callback queries
-  bot.on("callback_query", async (ctx, next) => {
-    try {
-      await ctx.answerCbQuery();
-    } catch {
-      logger.warn("⚠️ Ignored expired or invalid callback_query.");
-    }
-    return next();
-  });
-
-  // =====================================================
-  // 💾 Local Session Setup
-  // =====================================================
-  const localSession = new LocalSession({
-    database: "sessions.json",
-    storage: LocalSession.storageFileAsync,
-    property: "session",
-    format: {
-      serialize: (obj) => JSON.stringify(obj, null, 2),
-      deserialize: (str) => JSON.parse(str),
-    },
-  });
-  bot.use(localSession.middleware());
-
-  // Session + text log middleware
-  bot.use(async (ctx, next) => {
-    const userId = ctx.from?.id || "unknown";
-    const keys = ctx.session ? Object.keys(ctx.session) : [];
-    logger.info(
-      `💾 [Session] user=${userId} keys=${keys.length ? keys.join(", ") : "empty"}`
-    );
-    await next();
-  });
-
-  bot.on("text", (ctx, next) => {
-    logger.info(`🟢 [Text] ${ctx.from?.id}: ${ctx.message.text}`);
-    return next();
-  });
-
-  // =====================================================
-  // 🧩 Register Handlers (ordered)
-  // =====================================================
-  startHandler(bot);          // /start command and main menu
-  connectWalletHandler(bot);
-  walletHandler(bot);         // ✅ unified wallet system (deposit + link + balance)
-  betHandler(bot);
-  matchHandler(bot);
-  preMatchBetHandler(bot);
-  liveMatchBetHandler(bot);
-  helpHandler(bot);
-  howToPlayHandler(bot);
-  myBetsHandler(bot);
-  cancelBetHandler(bot);      // keep this last for safety
-
-  logger.info("✅ [Handlers] All bot handlers registered successfully.");
-
-  // =====================================================
-  // 🔗 Cross-Handler Helpers
-  // =====================================================
-  bot.showBalance = async (ctx) => {
-    try {
-      if (typeof bot.checkBalance === "function") {
-        await bot.checkBalance(ctx);
-      } else {
-        logger.warn("⚠️ [showBalance] checkBalance handler not attached yet.");
-        await ctx.reply("⚠️ Wallet handler unavailable. Try again soon.");
-      }
-    } catch (err) {
-      logger.error(`⚠️ [showBalance] Failed: ${err.message}`);
-      await ctx.reply("⚠️ Could not load your wallet right now.");
-    }
-  };
-
-  bot.showMainMenu = async (ctx) => {
-    try {
-      if (typeof bot.startHandler === "function") {
-        await bot.startHandler(ctx);
-      } else {
-        logger.warn("⚠️ [showMainMenu] startHandler not attached yet.");
-      }
-    } catch (err) {
-      logger.error(`⚠️ [showMainMenu] Failed: ${err.message}`);
-    }
-  };
-
-  // =====================================================
-  // 👀 Deposit Watcher
-  // =====================================================
-  try {
-    startDepositWatcher(bot);
-    logger.info("👀 [DepositWatcher] Active and monitoring deposits.");
-  } catch (err) {
-    logger.error(`⚠️ [DepositWatcher] Failed to start: ${err.message}`);
-  }
-
-  return bot;
+if (!token) {
+  logger.error("❌ BOT_TOKEN missing in .env file");
+  process.exit(1);
 }
 
 // =====================================================
-// 🚀 BOT INSTANCE + MATCH START WATCHER
+// 🧩 Single-instance protection
 // =====================================================
-const bot = createBot(process.env.BOT_TOKEN);
-
-(async () => {
-  try {
-    const { scheduleMatchStartWatchers } = await import("../cron/MatchStartWatcher.js");
-    await scheduleMatchStartWatchers(bot);
-    logger.info("🕒 [MatchStartWatcher] Initialized successfully.");
-
-    // Hourly refresh
-    setInterval(async () => {
-      try {
-        await scheduleMatchStartWatchers(bot);
-        logger.info("🔁 [MatchStartWatcher] Refreshed successfully.");
-      } catch (err) {
-        logger.error(`⚠️ [MatchStartWatcher] Hourly refresh failed: ${err.message}`);
-      }
-    }, 60 * 60 * 1000);
-  } catch (err) {
-    logger.error(`❌ [MatchStartWatcher] Initialization failed: ${err.message}`);
-  }
-})();
+if (global.botInstanceAlreadyStarted) {
+  logger.warn("⚠️ Duplicate bot.js import detected — skipping startup.");
+  process.exit(0);
+}
+global.botInstanceAlreadyStarted = true;
 
 // =====================================================
-// 🚀 LAUNCH BOT (Missing earlier — now fixed!)
+// ⚙️ Create Telegraf bot instance + Sessions
+// =====================================================
+const bot = new Telegraf(token);
+logger.info("🤖 [Bot] Telegram bot instance created successfully.");
+
+// 🧠 Enable LocalSession (required for play + wallet flow)
+const session = new LocalSession({
+  database: "sessions.json",
+  storage: LocalSession.storageFileAsync, // async safe disk writes
+});
+bot.use(session.middleware());
+logger.info("🧠 [Session] LocalSession middleware attached.");
+
+// =====================================================
+// 🧩 Register Bot Handlers (Order Matters)
+// =====================================================
+try {
+  // 🏁 Core user interactions
+  startHandler(bot);
+  helpHandler(bot);
+  howToPlayHandler(bot);
+  newUserHandler(bot);
+
+  // 🏏 Match + Betting Handlers
+  matchHandler(bot);
+  preMatchBetHandler(bot);
+  liveMatchBetHandler(bot);
+  betHandler(bot);
+  cancelBetHandler(bot);
+  myBetsHandler(bot);
+
+  // 💰 Wallet System
+  walletHandler(bot);
+  checkBalanceHandler(bot);
+
+  logger.info("✅ [Handlers] All bot handlers loaded successfully.");
+} catch (err) {
+  logger.error(`❌ [Handlers] Failed to initialize: ${err.message}`);
+  process.exit(1);
+}
+
+// =====================================================
+// 🚀 Launch the bot (polling mode)
 // =====================================================
 (async () => {
   try {
     await bot.launch();
-    logger.info("🤖 [Bot] CricPredict is now live and listening for updates!");
+    logger.info("🚀 Bot launched successfully and is polling for updates...");
+
+    // Start explicit cron jobs
+    startCleanupCron();
   } catch (err) {
-    logger.error(`❌ [Bot] Launch failed: ${err.message}`);
+    if (err.response?.error_code === 409) {
+      logger.error("❌ Telegram says another poller is active (409 Conflict).");
+      logger.warn("💡 Fix: Stop any running Node process or reboot the VPS.");
+      process.exit(0);
+    } else {
+      logger.error(`❌ Bot launch failed: ${err.message}`);
+      process.exit(1);
+    }
   }
 })();
 
-// Graceful shutdown hooks
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+// =====================================================
+// 💓 Heartbeat log — simple uptime visibility
+// =====================================================
+setInterval(() => {
+  logger.info("✅ [Heartbeat] Bot is alive and polling normally.");
+}, 3 * 60 * 60 * 1000);
 
 // =====================================================
-// 📤 Export Bot
+// 🧹 Graceful shutdown
+// =====================================================
+const shutdown = (signal) => {
+  logger.warn(`⚠️ Received ${signal}. Stopping bot gracefully...`);
+  try {
+    bot.stop(signal);
+  } finally {
+    process.exit(0);
+  }
+};
+
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+
+// =====================================================
+// 📤 Export bot instance
 // =====================================================
 export default bot;

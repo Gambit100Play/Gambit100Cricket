@@ -4,13 +4,12 @@ import { DateTime } from "luxon";
 import {
   getPendingPrematchMatches,
   lockMatchPool,
-  getPoolInfo,
   query,
 } from "../db/db.js";
 import { createPoolHash } from "../utils/hashUtils.js";
 import { publishHashToTron } from "../utils/tronPublisher.js";
 import { getMatchStatusSummary } from "../api/matchStatus.js";
-import { bot } from "../bot/bot.js";
+import bot from "../bot/bot.js";
 
 /**
  * 🔒 LockMatchCron

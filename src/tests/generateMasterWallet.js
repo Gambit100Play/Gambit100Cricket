@@ -1,37 +1,78 @@
-// src/tests/generateMasterWallet.js
-import { createRequire } from "module";
-import { mnemonicToSeedSync, generateMnemonic } from "@scure/bip39";
+// =============================================================
+// 🪙 Generate Master Wallet + Sample User Deposit Addresses
+// =============================================================
+import TronWebImport from "tronweb";
+import { generateMnemonic, mnemonicToSeedSync } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english.js";
+import { HDKey } from "@scure/bip32";
+import crypto from "crypto";
 
-import pkg from "tronweb";
-const { TronWeb } = pkg;
+// 🧩 Detect export style automatically (ESM vs CommonJS)
+const TronWeb = TronWebImport?.default?.TronWeb
+  || TronWebImport?.TronWeb
+  || TronWebImport?.default
+  || TronWebImport;
 
-const require = createRequire(import.meta.url);
-const bip32 = require("bip32");
-const ecc = require("tiny-secp256k1");
+// 🧠 Detect if it’s a class or a static object
+let tronWeb;
+try {
+  tronWeb = new TronWeb({
+    fullHost: "https://api.shasta.trongrid.io",
+  });
+} catch {
+  tronWeb = TronWeb; // fallback for static builds
+}
 
-// Ensure bip32 factory creation works for all versions
-const { BIP32Factory } = bip32;
-const BIP32 = BIP32Factory ? BIP32Factory(ecc) : bip32;
+console.log("===============================================");
+console.log("🚀 Generating New Master TRON Wallet...");
+console.log("===============================================");
 
-// 1️⃣ Generate mnemonic
-const mnemonic = bip39.generateMnemonic();
-console.log("Your master mnemonic (store safely!):", mnemonic);
+// 1️⃣ Generate a new mnemonic (BIP39)
+const mnemonic = generateMnemonic(wordlist);
+console.log("\n🔑 MASTER MNEMONIC (store securely!):\n", mnemonic);
 
-// 2️⃣ Derive seed + root key
-const seed = await bip39.mnemonicToSeed(mnemonic);
-const root = BIP32.fromSeed(Buffer.from(seed));
+// 2️⃣ Derive seed + root
+const seed = mnemonicToSeedSync(mnemonic);
+const root = HDKey.fromMasterSeed(seed);
 
-// 3️⃣ Derive TRON path m/44'/195'/0'/0/0
-const child = root.derivePath("m/44'/195'/0'/0/0");
+// 3️⃣ Derive the master path for TRON (BIP44, coin type 195)
+const masterPath = "m/44'/195'/0'/0/0";
+const masterNode = root.derive(masterPath);
 
-// 4️⃣ Clean hex private key
-let privateKey = child.privateKey;
-if (!Buffer.isBuffer(privateKey)) privateKey = Buffer.from(privateKey);
-const privateKeyHex = privateKey.toString("hex");
+// 4️⃣ Get the master private key and address
+const masterPriv = Buffer.from(masterNode.privateKey).toString("hex");
 
-// 5️⃣ Derive TRON address
-const tronWeb = new TronWeb({ fullHost: "https://api.trongrid.io" });
-const address = TronWeb.address.fromPrivateKey(privateKeyHex);
+// If tronWeb is a static object (non-instantiable), use static call:
+const masterAddress =
+  typeof tronWeb?.address?.fromPrivateKey === "function"
+    ? tronWeb.address.fromPrivateKey(masterPriv)
+    : TronWeb.address.fromPrivateKey(masterPriv);
 
-// ✅ Print result
-console.log("First address:", address);
+console.log("\n🏦 MASTER WALLET DETAILS:");
+console.log("→ Derivation Path:", masterPath);
+console.log("→ Master Address:", masterAddress);
+console.log("→ Master Private Key:", masterPriv);
+
+// 5️⃣ Optional: Generate AES-256 encryption key for your .env vault
+const aesKey = crypto.randomBytes(32);
+const aesKeyBase64 = aesKey.toString("base64");
+console.log("\n🧬 MASTER_ENCRYPTION_KEY (store in .env):", aesKeyBase64);
+
+// 6️⃣ Example: derive first 3 deterministic user deposit addresses
+console.log("\n📦 SAMPLE USER DEPOSIT ADDRESSES:");
+for (let i = 0; i < 3; i++) {
+  const userPath = `m/44'/195'/0'/0/${i}`;
+  const userNode = root.derive(userPath);
+  const userPriv = Buffer.from(userNode.privateKey).toString("hex");
+  const userAddress =
+    typeof tronWeb?.address?.fromPrivateKey === "function"
+      ? tronWeb.address.fromPrivateKey(userPriv)
+      : TronWeb.address.fromPrivateKey(userPriv);
+
+  console.log(`\nUser #${i}`);
+  console.log(`Path: ${userPath}`);
+  console.log(`Address: ${userAddress}`);
+  console.log(`Private Key: ${userPriv}`);
+}
+
+console.log("\n✅ Done! Save your MASTER_MNEMONIC & AES KEY in .env securely.");

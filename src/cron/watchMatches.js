@@ -1,6 +1,6 @@
 // src/cron/watchMatches.js
 import { getMatchById, updateMatchStatus } from "../db/db.js";
-import { lockPreMatchPool } from "../pool/poolLocker.js";  // ✅ use pool folder not services
+import { lockPreMatchPool } from "../services/poolLocker.js";
 
 /**
  * Checks if a match has reached toss stage and locks its pre-match pool.

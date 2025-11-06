@@ -1,16 +1,17 @@
 import { getAndClearPendingBets } from "../db/cache.js";
-import { placeBet } from "../db/db.js";
+import { placeBetWithDebit } from "../db/db.js";
 
 export async function flushPendingBets(telegramId) {
   const stagedBets = await getAndClearPendingBets(telegramId);
   for (const bet of stagedBets) {
-    await placeBet(
+    await placeBetWithDebit({
       telegramId,
-      bet.matchId,
-      bet.matchName,
-      bet.type,
-      bet.betOption,
-      bet.stake
-    );
+      matchId: bet.matchId,
+      matchName: bet.matchName,
+      betType: bet.type,
+      betOption: bet.betOption,
+      stake: bet.stake,
+      marketType: "PreMatch",
+    });
   }
 }
