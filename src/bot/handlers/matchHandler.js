@@ -1,74 +1,47 @@
+// ============================================================
+// 🏏 Match Handler (v4.0 — HTML Mode, Clean Output & Predict Buttons)
+// ============================================================
 import { Markup } from "telegraf";
 import { DateTime } from "luxon";
 import { getMatches, getMatchById } from "../../db/db.js";
 import { startPreMatchBet } from "./preMatchBetHandler.js";
-import { logger as customLogger } from "../../utils/logger.js";
+import { logger } from "../../utils/logger.js";
 
-const logger = customLogger || console;
-
-/* ============================================================
- 🕒 Safe universal formatter for start_time
-============================================================ */
-function formatStartTimeFromUTC(match, userZone = "Asia/Kolkata") {
+/* ---------- Format UTC → Local ---------- */
+function formatStartTimeFromUTC(match, zone = "Asia/Kolkata") {
   try {
-    let input = match.start_time;
-
-    // 🧩 Case 1: Already a Date
-    if (input instanceof Date) {
-      const dt = DateTime.fromJSDate(input, { zone: "utc" }).setZone(userZone);
-      return dt.isValid ? dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ") : "Invalid DateTime";
-    }
-
-    // 🧩 Case 2: "Sat Nov 01 2025 00:00:00 GMT+0530 (India Standard Time)" OR similar
-    if (typeof input === "string" && /GMT|\b[A-Z]{3,}\b/.test(input)) {
-      const dt = DateTime.fromJSDate(new Date(input), { zone: "utc" }).setZone(userZone);
-      return dt.isValid ? dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ") : "Invalid DateTime";
-    }
-
-    // 🧩 Case 3: ISO / SQL strings
-    if (typeof input === "string") {
-      let normalized = input.trim().replace(" ", "T");
-      if (!/[Z+-]\d{2}/.test(normalized)) normalized += "Z";
-      const dt = DateTime.fromISO(normalized, { zone: "utc" }).setZone(userZone);
-      return dt.isValid ? dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ") : "Invalid DateTime";
-    }
-
-    // 🧩 Case 4: Fallback with start_date + local time
-    if (!input && match.start_date && match.start_time_local) {
-      const dateStr = `${match.start_date} ${match.start_time_local}`;
-      const dt = DateTime.fromFormat(dateStr, "yyyy-LL-dd HH:mm:ss", { zone: "utc" }).setZone(userZone);
-      return dt.isValid ? dt.toFormat("dd LLL yyyy, hh:mm a ZZZZ") : "TBA";
-    }
-
-    return "TBA";
-  } catch (err) {
-    logger.error(`❌ [formatStartTimeFromUTC] ${err.message}`);
-    return "Invalid DateTime";
+    if (!match?.start_time) return "TBA";
+    const iso = typeof match.start_time === "string"
+      ? match.start_time.replace(" ", "T") + (match.start_time.includes("Z") ? "" : "Z")
+      : match.start_time.toISOString();
+    const dt = DateTime.fromISO(iso, { zone: "utc" });
+    return dt.isValid ? dt.setZone(zone).toFormat("dd LLL yyyy, hh:mm a") : "Invalid";
+  } catch {
+    return "Invalid";
   }
 }
 
-
-/* ============================================================
- 🌍 Determine user's timezone by locale
-============================================================ */
+/* ---------- User Timezone ---------- */
 function getUserTimeZone(ctx) {
-  const locale = ctx.from?.language_code?.toLowerCase() || "en";
-  const regionMap = {
-    en: "Asia/Kolkata",
-    en_us: "America/New_York",
-    en_gb: "Europe/London",
-    hi: "Asia/Kolkata",
-    ar: "Asia/Dubai",
-    ru: "Europe/Moscow",
-    id: "Asia/Jakarta",
-    nl: "Europe/Amsterdam",
+  const lang = ctx.from?.language_code?.toLowerCase() || "en";
+  const zones = {
+    en: "Asia/Kolkata", hi: "Asia/Kolkata",
+    en_us: "America/New_York", en_gb: "Europe/London",
+    ar: "Asia/Dubai", ru: "Europe/Moscow",
+    id: "Asia/Jakarta", nl: "Europe/Amsterdam",
   };
-  return regionMap[locale] || "Asia/Kolkata";
+  return zones[lang] || "Asia/Kolkata";
 }
 
-/* ============================================================
- 📱 Main Match Handler
-============================================================ */
+/* ---------- Escape HTML ---------- */
+function html(text = "") {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/* ---------- Main Handler ---------- */
 export default function matchHandler(bot) {
   bot.action("matches", async (ctx) => {
     try { await ctx.answerCbQuery("Loading matches..."); } catch {}
@@ -80,191 +53,145 @@ export default function matchHandler(bot) {
     await showMatches(ctx);
   });
 
-  bot.action("disabled_live", async (ctx) => {
-    try { await ctx.answerCbQuery("🔒 Live predictions will open once toss is done!"); } catch {}
-  });
+  bot.action("disabled_live", (ctx) =>
+    ctx.answerCbQuery("🔒 Live predictions open after toss.")
+  );
+  bot.action("disabled_pre", (ctx) =>
+    ctx.answerCbQuery("🔒 Pre-match predictions closed.")
+  );
 
-  bot.action("disabled_pre", async (ctx) => {
-    try { await ctx.answerCbQuery("🔒 Pre-match predictions closed — match is live!"); } catch {}
-  });
-
-  // 🎯 Predict Now
+  /* ---------- Predict Now ---------- */
   bot.action(/^predict_(.+)/, async (ctx) => {
     await ctx.answerCbQuery();
     const matchId = ctx.match[1];
     const match = await getMatchById(matchId);
-    if (!match) return ctx.reply("❌ Match not found or has expired.");
+    if (!match) return ctx.reply("❌ Match not found.");
 
-    const userZone = getUserTimeZone(ctx);
-    const status = (match.status || "").toLowerCase();
-    const isLive = /(live|in progress|playing)/.test(status);
+    const zone = getUserTimeZone(ctx);
+    const live = /(live|playing|in progress|locked_pre)/.test(
+      (match.status || "").toLowerCase()
+    );
 
-    // Parse toss info
-    let payload = {};
+    let tossText = "🕓 <b>Toss:</b> Not yet done";
     try {
-      payload = typeof match.api_payload === "object"
-        ? match.api_payload
-        : JSON.parse(match.api_payload || "{}");
-    } catch (err) {
-      logger.warn(`⚠️ Could not parse payload: ${err.message}`);
-    }
+      const p =
+        typeof match.api_payload === "object"
+          ? match.api_payload
+          : JSON.parse(match.api_payload || "{}");
+      const w = p?.tossResults?.tossWinnerName || p?.tossWinnerName;
+      const d = p?.tossResults?.decision || p?.tossDecision;
+      if (w && d) tossText = `🪙 <b>Toss:</b> ${html(`${w} won the toss and chose to ${d} first`)}`;
+    } catch {}
 
-    const tossWinner =
-      payload?.tossResults?.tossWinnerName ||
-      payload?.tossWinnerName ||
-      payload?.tossWinner ||
-      payload?.toss_winner ||
-      null;
+    const info = `
+<b>${live ? "🔴 LIVE" : "🕓 UPCOMING"}</b> | <b>${html(match.name)}</b>
+📅 <b>${html(formatStartTimeFromUTC(match, zone))}</b>
+${tossText}
+📍 <b>Status:</b> ${html(match.status || "TBD")}
+`.trim();
 
-    const tossDecision =
-      payload?.tossResults?.decision ||
-      payload?.tossDecision ||
-      payload?.toss_decision ||
-      null;
+    const buttons = live
+      ? [
+          [Markup.button.callback("⚫ Pre-Match (Locked)", "disabled_pre"),
+           Markup.button.callback("🔴 Live Prediction", `live_${match.match_id}`)],
+          [Markup.button.callback("🔙 Back to Matches", "matches")],
+        ]
+      : [
+          [Markup.button.callback("🎯 Pre-Match Prediction", `prematch_${match.match_id}`),
+           Markup.button.callback("⚫ Live (Locked)", "disabled_live")],
+          [Markup.button.callback("🔙 Back to Matches", "matches")],
+        ];
 
-    const tossString =
-      tossWinner && tossDecision
-        ? `${tossWinner} won the toss and chose to ${tossDecision.toLowerCase()} first`
-        : null;
-
-    const tossDone = Boolean(tossString);
-    const tossStatus = tossDone
-      ? `🪙 *Toss:* ${tossString}`
-      : "🕓 *Toss:* Not yet done";
-
-    const isEligibleForLive = isLive || tossDone;
-    const when = formatStartTimeFromUTC(match, userZone);
-
-    const matchInfo = isEligibleForLive
-      ? `🏏 *${match.name}*\n📅 *Live:* ${when}\n📍 *Status:* 🔴 LIVE\n${tossStatus}`
-      : `🏏 *${match.name}*\n📅 *Scheduled:* ${when}\n📍 *Status:* 🕓 Awaiting Toss\n${tossStatus}`;
-
-    const buttons = [];
-    if (isEligibleForLive) {
-      buttons.push([
-        Markup.button.callback("⚫ Pre-Match (Locked)", "disabled_pre"),
-        Markup.button.callback("🔴 Live Match Prediction", `live_${match.id}`),
-      ]);
-    } else {
-      buttons.push([
-        Markup.button.callback("🎯 Pre-Match Prediction", `prematch_${match.id}`),
-        Markup.button.callback("⚫ Live Match (Locked)", "disabled_live"),
-      ]);
-    }
-    buttons.push([Markup.button.callback("🔙 Back to Matches", "matches")]);
-
-    await ctx.reply(`${matchInfo}\n\n🎯 *Choose your prediction type:*`, {
-      parse_mode: "Markdown",
-      ...Markup.inlineKeyboard(buttons),
+    await ctx.reply(`${info}\n\n🎯 <b>Choose your prediction type:</b>`, {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard(buttons).reply_markup,
     });
   });
 
-  // 🎯 Pre-Match Prediction
+  /* ---------- Pre-Match ---------- */
   bot.action(/^prematch_(.+)/, async (ctx) => {
     await ctx.answerCbQuery();
-    const matchId = ctx.match[1];
-    logger.info(`🎯 [PreMatch Triggered] ${matchId}`);
     try {
-      await startPreMatchBet(ctx, matchId);
+      await startPreMatchBet(ctx, ctx.match[1]);
     } catch (err) {
-      logger.error(`❌ PreMatchBet error: ${err.message}`);
+      logger.error(`❌ [PreMatchBet] ${err.message}`);
       ctx.reply("⚠️ Could not open pre-match prediction screen.");
     }
   });
-
-  // 🔴 Live placeholder
-  bot.action(/^live_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const matchId = ctx.match[1];
-    logger.info(`🔴 [LiveMatch Triggered] ${matchId}`);
-    ctx.reply("🚧 Live predictions coming soon.", { parse_mode: "Markdown" });
-  });
 }
 
-/* ============================================================
- 🧭 Helper: Show Top 5 Matches
-============================================================ */
+/* ---------- Show Matches ---------- */
 async function showMatches(ctx) {
-  const matches = await getMatches();
-  if (!matches?.length)
-    return ctx.reply("📭 No live or scheduled matches available right now.");
+  const all = await getMatches();
+  if (!all?.length)
+    return ctx.reply("📭 No live or upcoming matches right now.");
 
-  const filtered = matches
+  const filtered = all
     .filter((m) =>
-      ["live", "in progress", "playing", "upcoming", "scheduled", "fixture"].some((x) =>
+      ["live", "playing", "in progress", "upcoming", "scheduled", "locked_pre"].some((x) =>
         (m.status || "").toLowerCase().includes(x)
       )
     )
-    .sort((a, b) => new Date(a.start_time || a.start_date) - new Date(b.start_time || b.start_date))
+    .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
     .slice(0, 5);
 
-  if (!filtered.length)
-    return ctx.reply("📭 No live or scheduled matches available right now.");
+  const zone = getUserTimeZone(ctx);
+  const now = DateTime.now().setZone(zone);
 
-  const userZone = getUserTimeZone(ctx);
-  const nowLocal = DateTime.now().setZone(userZone);
-
-  await ctx.reply("📅 *Top 5 Matches (Live or Upcoming)*", { parse_mode: "Markdown" });
-
-  for (const m of filtered) {
-    const isLive = /(live|in progress|playing)/.test((m.status || "").toLowerCase());
-    const prefix = isLive ? "🔴 LIVE" : "🕓 UPCOMING";
-    const when = formatStartTimeFromUTC(m, userZone);
-
-    // countdown
-    let countdown = "";
-    try {
-      let raw = m.start_time;
-      if (raw instanceof Date) raw = raw.toISOString();
-      else if (typeof raw === "string") {
-        raw = raw.trim();
-        if (raw.includes(" ")) raw = raw.replace(" ", "T");
-        if (!/[Z+-]\d{2}/.test(raw)) raw += "Z";
-      }
-
-      if (raw) {
-        const matchDT = DateTime.fromISO(raw, { zone: "utc" }).setZone(userZone);
-        const diff = matchDT.diff(nowLocal, ["hours", "minutes"]);
-        if (diff.as("minutes") > 0) {
-          const h = Math.floor(diff.hours);
-          const mLeft = Math.floor(diff.minutes % 60);
-          countdown = `⏳ *Starts in:* ${h > 0 ? `${h}h ` : ""}${mLeft}m`;
-        } else countdown = "🪙 *Toss likely completed*";
-      } else countdown = "⏳ *Start time:* Unknown";
-    } catch (err) {
-      logger.warn(`⚠️ [Countdown Failed] ${err.message}`);
-      countdown = "⏳ *Start time:* Unknown";
-    }
-
-    const venue = m.venue
-      ? `🏟️ ${m.venue}${m.city ? `, ${m.city}` : ""}`
-      : "🏟️ Venue TBA";
-    const seriesInfo = `${m.series_name || "Unknown Series"} (${m.match_format || "TBD"})`;
-
-    const messageText = `
-${prefix} | *${m.name}*
-🏆 *${seriesInfo}*
-📅 *${when}*
-${countdown}
-${venue}
-🌍 *Country:* ${m.country || "Unknown"}
-📍 *Status:* ${m.status?.toUpperCase() || "TBD"}
-    `.trim();
-
-    const button = Markup.inlineKeyboard([
-      [Markup.button.callback("🎯 Predict Now", `predict_${m.id}`)],
-    ]);
-
-    await ctx.reply(messageText, { parse_mode: "Markdown", ...button });
-  }
-
-  await ctx.reply("🔄 You can refresh or go back 👇", {
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback("🔄 Refresh", "matches_refresh")],
-      [Markup.button.callback("🔙 Back to Main Menu", "main_menu")],
-    ]),
+  await ctx.reply("<b>📅 Top 5 Matches (Live or Upcoming)</b>", {
+    parse_mode: "HTML",
   });
 
-  const updatedAt = nowLocal.toFormat("dd LLL yyyy, hh:mm a ZZZZ");
-  await ctx.reply(`📡 *Last Updated:* ${updatedAt}`, { parse_mode: "Markdown" });
+  for (const m of filtered) {
+    const live = /(live|playing|in progress|locked_pre)/.test(
+      (m.status || "").toLowerCase()
+    );
+    const prefix = live ? "🔴 LIVE" : "🕓 UPCOMING";
+    const when = formatStartTimeFromUTC(m, zone);
+
+    // Countdown
+    let countdown = "⏳ <b>Start time:</b> Unknown";
+    try {
+      const dt = DateTime.fromISO(String(m.start_time).replace(" ", "T"), { zone: "utc" }).setZone(zone);
+      const diff = dt.diff(now, ["hours", "minutes"]);
+      if (diff.as("minutes") > 0) {
+        const h = Math.floor(diff.hours);
+        const mLeft = Math.floor(diff.minutes % 60);
+        countdown = `⏳ <b>Starts in:</b> ${h > 0 ? `${h}h ` : ""}${mLeft}m`;
+      } else countdown = "🪙 <b>Toss likely completed</b>";
+    } catch {}
+
+    const msg = `
+<b>${prefix}</b> | <b>${html(m.name)}</b>
+🏆 <b>${html(m.series_name || "Unknown Series")} (${html(m.match_format || "TBD")})</b>
+📅 <b>${html(when)}</b>
+${countdown}
+🏟️ ${m.venue ? html(m.venue) + (m.city ? `, ${html(m.city)}` : "") : "Venue TBA"}
+🌍 <b>Country:</b> ${html(m.country || "Unknown")}
+📍 <b>Status:</b> ${html(m.status?.toUpperCase() || "TBD")}
+`.trim();
+
+    const buttons = Markup.inlineKeyboard([
+      [Markup.button.callback("🎯 Predict Now", `predict_${m.match_id}`)],
+    ]);
+
+    await ctx.reply(msg, {
+      parse_mode: "HTML",
+      reply_markup: buttons.reply_markup,
+    });
+  }
+
+  const footer = Markup.inlineKeyboard([
+    [Markup.button.callback("🔄 Refresh", "matches_refresh")],
+    [Markup.button.callback("🔙 Back to Main Menu", "main_menu")],
+  ]);
+
+  await ctx.reply("🔄 You can refresh or go back 👇", {
+    parse_mode: "HTML",
+    reply_markup: footer.reply_markup,
+  });
+
+  await ctx.reply(`📡 <b>Last Updated:</b> ${html(now.toFormat("dd LLL yyyy, hh:mm a"))}`, {
+    parse_mode: "HTML",
+  });
 }

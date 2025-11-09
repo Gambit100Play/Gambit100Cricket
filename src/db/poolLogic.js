@@ -5,10 +5,10 @@ import { logger } from "../utils/logger.js";
 /**
  * ============================================================
  * 🔍 getPoolInfo()
- * Aggregates pool data from bets table.
- *  - Supports: full pool or single bet option
- *  - Computes participants, total stake, unique plays
+ * Aggregates pool data from bets table (excluding cancelled/voided bets)
+ *  - Computes participants, total stake, and distinct plays
  *  - Dynamically marks pool as 'active' or 'pending'
+ *  - Used by odds engine + UI
  * ============================================================
  */
 export async function getPoolInfo(
@@ -20,11 +20,13 @@ export async function getPoolInfo(
   const matchIdText = String(matchId).trim();
   const poolTypeClean = poolType.replace(/\s+/g, "").toLowerCase();
 
-  logger.info(`🎯 [getPoolInfo] match=${matchIdText}, poolType=${poolTypeClean}, betOption=${betOption || "ALL"}`);
+  logger.info(
+    `🎯 [getPoolInfo] match=${matchIdText}, poolType=${poolTypeClean}, betOption=${betOption || "ALL"}`
+  );
 
   try {
     // ============================================================
-    // CASE 1 — Single bet option
+    // CASE 1 — Single bet option aggregation
     // ============================================================
     if (betOption) {
       const sql = `
@@ -35,6 +37,7 @@ export async function getPoolInfo(
         WHERE TRIM(match_id)::text = $1
           AND REPLACE(LOWER(market_type), ' ', '') = $2
           AND LOWER(TRIM(bet_option)) = LOWER(TRIM($3))
+          AND LOWER(status) NOT IN ('cancelled', 'voided')
       `;
       const res = await query(sql, [matchIdText, poolTypeClean, betOption]);
       const row = res.rows[0] || { participants: 0, total_stake: 0 };
@@ -67,20 +70,27 @@ export async function getPoolInfo(
     // ============================================================
 
     const [playersRes, playsRes, stakesRes] = await Promise.all([
+      // 🎯 Unique players (excluding cancelled/voided)
       query(
         `SELECT COUNT(DISTINCT telegram_id) AS unique_players
          FROM bets
          WHERE TRIM(match_id)::text = $1
-           AND REPLACE(LOWER(market_type), ' ', '') = $2`,
+           AND REPLACE(LOWER(market_type), ' ', '') = $2
+           AND LOWER(status) NOT IN ('cancelled', 'voided')`,
         [matchIdText, poolTypeClean]
       ),
+
+      // 🎯 Unique distinct bet options
       query(
         `SELECT COUNT(DISTINCT LOWER(TRIM(bet_option))) AS unique_plays
          FROM bets
          WHERE TRIM(match_id)::text = $1
-           AND REPLACE(LOWER(market_type), ' ', '') = $2`,
+           AND REPLACE(LOWER(market_type), ' ', '') = $2
+           AND LOWER(status) NOT IN ('cancelled', 'voided')`,
         [matchIdText, poolTypeClean]
       ),
+
+      // 🎯 Aggregated stake per option
       query(
         `SELECT 
             LOWER(TRIM(bet_option)) AS key,
@@ -90,6 +100,7 @@ export async function getPoolInfo(
          FROM bets
          WHERE TRIM(match_id)::text = $1
            AND REPLACE(LOWER(market_type), ' ', '') = $2
+           AND LOWER(status) NOT IN ('cancelled', 'voided')
          GROUP BY bet_option`,
         [matchIdText, poolTypeClean]
       ),
@@ -99,7 +110,7 @@ export async function getPoolInfo(
     const uniquePlays = Number(playsRes.rows[0]?.unique_plays || 0);
     let rows = stakesRes.rows || [];
 
-    // Always include default bet options to keep the pool consistent
+    // 🧩 Always include baseline market options
     const defaultOptions = [
       "Team A to Win",
       "Team B to Win",
@@ -116,7 +127,7 @@ export async function getPoolInfo(
       }
     }
 
-    // De-duplicate
+    // 🧹 De-duplicate rows safely
     const seen = new Set();
     rows = rows.filter((r) => {
       const k = r.key.toLowerCase();
@@ -125,13 +136,9 @@ export async function getPoolInfo(
       return true;
     });
 
-    // Order logically
-    const order = new Map(defaultOptions.map((opt, i) => [opt.toLowerCase(), i]));
-    rows.sort((a, b) => (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999));
-
-    // Compute overall totals
+    // 🧮 Compute totals and readiness
     const totalStake = rows.reduce((a, r) => a + Number(r.total_stake || 0), 0);
-    const minStakeThreshold = 100; // activate if total ≥ 100 G
+    const minStakeThreshold = 100; // G-tokens threshold for activation
     const minUniquePlays = 3;
 
     const status =

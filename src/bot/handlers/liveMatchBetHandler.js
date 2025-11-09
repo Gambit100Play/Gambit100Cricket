@@ -1,8 +1,19 @@
-// src/bot/handlers/liveMatchBetHandler.js
+// ============================================================
+// 🏏 liveMatchBetHandler — Show Active Live Pools + Place Bets
+// ============================================================
+//
+// Purpose:
+// • Shows currently active pools from live_pools for a given match
+// • Lets users select Over/Under bets
+// • Handles stake input + DB debit
+// ============================================================
+
 import { Markup } from "telegraf";
 import { DateTime } from "luxon";
 import { query, getMatchById, placeBetWithDebit } from "../../db/db.js";
-import { logger } from "../../utils/logger.js";
+import { logger as customLogger } from "../../utils/logger.js";
+
+const logger = customLogger || console;
 
 /* ============================================================
  🕒 Helper — Format UTC → IST
@@ -52,26 +63,32 @@ export default function liveMatchBetHandler(bot) {
   ============================================================ */
   bot.action(/live_(.+)/, async (ctx) => {
     await ctx.answerCbQuery();
-    const matchId = ctx.match[1];
+    const rawMatchId = ctx.match[1];
+    const matchId = parseInt(String(rawMatchId).replace(/^m-/, ""), 10);
+
+    if (isNaN(matchId)) {
+      logger.error(`[LiveBetEntry] Invalid matchId: ${rawMatchId}`);
+      return ctx.reply("⚠️ Invalid match reference. Please try again.");
+    }
+
     logger.info(`🎯 [LiveBetEntry] user=${ctx.from.id} match=${matchId}`);
 
     const match = await getMatchById(matchId);
     if (!match) {
-      logger.warn(`[LiveBetEntry] Match ${matchId} not found`);
+      logger.warn(`[LiveBetEntry] Match ${matchId} not found in DB`);
       return ctx.reply("❌ Match not found or has expired.");
     }
 
-    // Extract basic info
+    // Extract team info
     let teamA = "Team A";
     let teamB = "Team B";
-    let payload;
     try {
-      payload =
+      const payload =
         typeof match.api_payload === "object" && match.api_payload !== null
           ? match.api_payload
           : JSON.parse(match.api_payload || "{}");
-      if (Array.isArray(payload.teams) && payload.teams.length === 2)
-        [teamA, teamB] = payload.teams;
+      teamA = payload?.team1?.teamName || teamA;
+      teamB = payload?.team2?.teamName || teamB;
     } catch (err) {
       logger.warn(`⚠️ [LiveBetEntry] Failed to parse api_payload: ${err.message}`);
     }
@@ -91,17 +108,19 @@ export default function liveMatchBetHandler(bot) {
     }
 
     /* ============================================================
-     🔍 Fetch Active Live Pools from DB
+     🔍 Fetch Active Live Pools from DB (Cast to bigint)
     ============================================================ */
     let poolsRes;
     try {
       poolsRes = await query(
-        `SELECT id, category, threshold, end_over 
-         FROM live_pools 
-         WHERE matchid=$1 AND status='active'
-         ORDER BY category`,
+        `SELECT id, category, start_over, end_over, threshold
+           FROM live_pools
+          WHERE matchid = $1::bigint
+            AND LOWER(status) = 'active'
+          ORDER BY category`,
         [matchId]
       );
+      logger.info(`[LiveBetEntry] Found ${poolsRes.rowCount} active pools for match ${matchId}`);
     } catch (err) {
       logger.error(`[LiveBetEntry] DB fetch failed for ${matchId}: ${err.message}`);
       return ctx.reply("⚠️ Could not load live markets.");
@@ -126,14 +145,13 @@ export default function liveMatchBetHandler(bot) {
         `live_under_${p.id}`
       ),
     ]);
-
     buttons.push([Markup.button.callback("🔙 Back", "matches")]);
 
     const scoreInfo = match.score || "Not available";
     const header =
       `🔴 *Live Predictions* — ${teamAFlag} ${teamA} vs ${teamBFlag} ${teamB}\n\n` +
       `📊 *Score:* ${scoreInfo}\n` +
-      `🎯 *Active Markets (till ${pools[0].end_over} overs)*`;
+      `🎯 *Active Market Window:* Overs ${pools[0].start_over}-${pools[0].end_over}`;
 
     await ctx.reply(header, {
       parse_mode: "Markdown",
@@ -142,7 +160,7 @@ export default function liveMatchBetHandler(bot) {
   });
 
   /* ============================================================
-   🧠 Generic Live Pool Selection — Over/Under
+   🧠 Live Pool Selection — Over/Under
   ============================================================ */
   bot.action(/live_(over|under)_(\d+)/, async (ctx) => {
     await ctx.answerCbQuery();
@@ -153,11 +171,12 @@ export default function liveMatchBetHandler(bot) {
     try {
       const poolRes = await query(
         `SELECT lp.id, lp.matchid, lp.category, lp.threshold, lp.end_over, m.name
-         FROM live_pools lp
-         JOIN matches m ON m.match_id = lp.matchid
-         WHERE lp.id=$1`,
+           FROM live_pools lp
+           JOIN matches m ON m.match_id = lp.matchid
+          WHERE lp.id = $1::integer`,
         [poolId]
       );
+
       const pool = poolRes.rows[0];
       if (!pool) {
         logger.warn(`[LivePoolSelect] Pool ${poolId} not found or locked.`);
@@ -179,10 +198,9 @@ export default function liveMatchBetHandler(bot) {
         segmentDuration: pool.end_over,
       });
 
-      await ctx.reply(
-        `🎯 *${betOption}*\n💰 Enter your stake amount (in G-Tokens):`,
-        { parse_mode: "Markdown" }
-      );
+      await ctx.reply(`🎯 *${betOption}*\n💰 Enter your stake amount (in G-Tokens):`, {
+        parse_mode: "Markdown",
+      });
     } catch (err) {
       logger.error(`[LivePoolSelect] Failed for pool ${poolId}: ${err.message}`);
       ctx.reply("⚠️ Could not fetch live pool. Try again later.");
@@ -195,7 +213,7 @@ export default function liveMatchBetHandler(bot) {
   bot.on("text", async (ctx) => {
     const telegramId = ctx.from.id;
     const stakeInfo = waitingForStake.get(telegramId);
-    if (!stakeInfo) return; // ignore non-stake text
+    if (!stakeInfo) return;
 
     const stake = parseFloat(ctx.message.text);
     if (isNaN(stake) || stake <= 0) {

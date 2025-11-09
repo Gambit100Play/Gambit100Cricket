@@ -1,5 +1,5 @@
 // ============================================================
-// 🏏 Pre-Match Bet Handler — Stable + UX Polished (v3.3)
+// 🏏 Pre-Match Bet Handler — Stable Logic (v3.5)
 // ============================================================
 
 import { Markup } from "telegraf";
@@ -35,7 +35,7 @@ async function buildPreMatchScreen(ctx, matchId) {
   const match = await getMatchById(matchId);
   if (!match) return ctx.reply("❌ Match not found in database.");
 
-  // ✅ Parse payload
+  // ✅ Parse payload safely
   let payload = {};
   try {
     payload =
@@ -51,32 +51,45 @@ async function buildPreMatchScreen(ctx, matchId) {
   const venue = payload?.venueInfo?.ground || match.venue || "Unknown Ground";
   const when = formatStartIST(match.start_time);
 
+  // 🏊 Get pool info
   const pool = await getPoolInfo(matchId, "PreMatch");
 
+  // 🎯 Count distinct bet options placed
   const distinctRes = await query(
-    `SELECT COUNT(DISTINCT LOWER(bet_option)) AS unique_plays
-       FROM bets WHERE match_id=$1 AND LOWER(market_type)=LOWER($2)`,
+    `SELECT COUNT(DISTINCT LOWER(TRIM(bet_option))) AS unique_plays
+       FROM bets 
+      WHERE match_id=$1 
+        AND LOWER(market_type)=LOWER($2)
+        AND status NOT IN ('Cancelled','Voided')`,
     [matchId, "PreMatch"]
   );
-  const distinctPlays = Number(distinctRes.rows[0]?.unique_plays || 0);
-  const status = distinctPlays >= 3 ? "active" : "pending";
+
+  const uniquePlays = Number(distinctRes.rows[0]?.unique_plays || 0);
+  const status = uniquePlays >= 3 ? "active" : "pending";
   const locked = pool?.status === "locked";
 
-  // 🎲 Odds
-  const oddsData = await getDynamicOdds(matchId, "PreMatch");
+  // 🎲 Odds calculation (only when 3+ distinct bets exist)
+  let oddsData = [];
+  if (status === "active") {
+    oddsData = await getDynamicOdds(matchId, "PreMatch");
+  }
+
   const odds = Object.fromEntries(
     (oddsData || []).map((o) => [o.bet_option.toLowerCase(), o.odds])
   );
-  const showOdds = (opt) =>
-    status === "active" && odds[opt.toLowerCase()]
-      ? ` (${odds[opt.toLowerCase()]}x)`
-      : "";
 
-  // 🧠 Store shortId mapping
+  // 👁️ Show odds only if pool is active (3+ distinct bet options)
+  const showOdds = (opt) => {
+    if (status !== "active") return "";
+    const val = odds[opt.toLowerCase()];
+    return val ? ` (${val}x)` : "";
+  };
+
+  // 🧠 Map short ID for callback handling
   const shortId = String(matchId).slice(0, 8);
   global.matchIdMap.set(shortId, matchId);
 
-  // 🧱 Inline Keyboard
+  // 🧱 Inline Keyboard Layout
   const buttons = locked
     ? [[Markup.button.callback("🔒 Predictions Locked", "noop_locked")]]
     : [
@@ -109,20 +122,31 @@ async function buildPreMatchScreen(ctx, matchId) {
         [Markup.button.callback("🔄 Refresh Pool", `refresh_pool_${shortId}`)],
       ];
 
-  // 🗣️ Message
-  await ctx.reply(
+  // 🗣️ Build Message Text
+  const header =
     `🟢 *Pre-Match Predictions* — ${match.name}\n\n` +
-      `📅 *Scheduled:* ${when} IST\n` +
-      `🏟️ *Venue:* ${venue}\n` +
-      `🧾 *Format:* ${payload?.matchFormat || match.match_format || "Unknown"}\n\n` +
-      (locked
-        ? "🔒 *Predictions Closed*\n\n"
-        : status === "pending"
-        ? "🚧 *Waiting for more players...*\n\n"
-        : "✅ *Pool Active — Odds Live!*\n\n") +
-      "Select a market below to lock your 100 G play.",
-    { parse_mode: "Markdown", ...Markup.inlineKeyboard(buttons) }
-  );
+    `📅 *Scheduled:* ${when} IST\n` +
+    `🏟️ *Venue:* ${venue}\n` +
+    `🧾 *Format:* ${payload?.matchFormat || match.match_format || "Unknown"}\n\n`;
+
+  let poolStatusMsg = "";
+  if (locked) {
+    poolStatusMsg = "🔒 *Predictions Closed*\n\n";
+  } else if (status === "pending") {
+    poolStatusMsg =
+      "🚧 *Waiting for more players...*\n" +
+      "_Odds will unlock after at least 3 different bets are placed._\n\n";
+  } else {
+    poolStatusMsg = "✅ *Pool Active — Odds Live!*\n\n";
+  }
+
+  const msg =
+    header + poolStatusMsg + "Select a market below to lock your 100 G play.";
+
+  await ctx.reply(msg, {
+    parse_mode: "Markdown",
+    ...Markup.inlineKeyboard(buttons),
+  });
 }
 
 /* ------------------------------------------------------------
@@ -163,7 +187,6 @@ export default function preMatchBetHandler(bot) {
       const match = await getMatchById(matchId);
       if (!match) return ctx.reply("❌ Match not found.");
 
-      // 🧠 Store session state
       ctx.session.currentPlay = {
         matchId,
         marketType: "PreMatch",
@@ -188,7 +211,7 @@ export default function preMatchBetHandler(bot) {
     }
   });
 
-  // ❌ Cancel play (removes confirmation message)
+  // ❌ Cancel play confirmation
   bot.action("cancel_play", async (ctx) => {
     try {
       await ctx.deleteMessage().catch(() => null);
@@ -202,6 +225,6 @@ export default function preMatchBetHandler(bot) {
 
   // 🔒 Locked pool safeguard
   bot.action("noop_locked", async (ctx) => {
-    await ctx.answerCbQuery("🔒 Predictions closed after toss");
+    await ctx.answerCbQuery("🔒 Predictions closed after toss.");
   });
 }

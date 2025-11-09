@@ -1,10 +1,20 @@
+// ============================================================
+// 🕓 Match Fetch Cron — Unified Upcoming + Live Fetcher
+// ============================================================
+//
+// Purpose:
+// • Runs ensureAllMatches() every 6 hours (00:00, 06:00, 12:00, 18:00 IST)
+// • Prevents overlap
+// • Logs duration, memory usage, and DB summary
+// ============================================================
+
 import cron from "node-cron";
-import { ensureUpcomingMatches } from "../api/fetchAllMatches.js";
+import { ensureAllMatches } from "../api/fetchAllMatches.js";  // ✅ unified fetcher
 import { DateTime } from "luxon";
 import { logger } from "../utils/logger.js";
 
 const TZ = "Asia/Kolkata";
-const CRON_EXPR = "0 */6 * * *"; // every 6 hours (00, 06, 12, 18)
+const CRON_EXPR = "0 */6 * * *"; // every 6 hours
 
 console.log("🕓 [Cron] Match Fetch Cron initialized.");
 logger.info({
@@ -31,22 +41,23 @@ export async function fetchMatches() {
   isRunning = true;
 
   const nowDisplay = DateTime.now().setZone(TZ).toFormat("dd LLL yyyy, hh:mm a");
-  const headline = `🕒 ${nowDisplay} - 📅 Running Manual or Scheduled Match Fetch...`;
+  const headline = `🕒 ${nowDisplay} - 🏏 Running Scheduled Match Fetch (Upcoming + Live)…`;
 
   console.log(headline);
   logger.info({
-    msg: "Fetch started",
+    msg: "Match fetch started",
     headline,
     pid: process.pid,
     when_ist: nowDisplay,
   });
 
   try {
-    // If ensureUpcomingMatches() can return summary, capture it; else we’ll log generic success.
-    const summary = await ensureUpcomingMatches();
+    // ✅ Use unified fetcher now
+    const summary = await ensureAllMatches();
 
     const durationMs = Date.now() - startTs;
     const mem = process.memoryUsage();
+
     logger.info({
       msg: "MatchFetchCron completed successfully",
       duration_ms: durationMs,
@@ -58,7 +69,8 @@ export async function fetchMatches() {
         external: Math.round(mem.external / 1_048_576),
       },
     });
-    console.log("✅ [MatchFetchCron] Fetch completed successfully.");
+
+    console.log("✅ [MatchFetchCron] Unified fetch completed successfully.");
   } catch (err) {
     const durationMs = Date.now() - startTs;
     logger.error({
@@ -73,10 +85,11 @@ export async function fetchMatches() {
   }
 }
 
-// Start the cron task
+// ============================================================
+// 🕒 Schedule Cron Task
+// ============================================================
 const task = cron.schedule(CRON_EXPR, fetchMatches, { timezone: TZ });
 
-// Optional: start-up ping to confirm scheduling
 logger.info({
   msg: "MatchFetchCron scheduled",
   cron: CRON_EXPR,
@@ -84,7 +97,9 @@ logger.info({
   status: "started",
 });
 
-// Optional: expose a manual trigger function (e.g., for CLI/tests)
+// ============================================================
+// 💥 Manual Trigger (for CLI or test usage)
+// ============================================================
 export async function runNow() {
   logger.info({ msg: "Manual trigger invoked for MatchFetchCron" });
   await fetchMatches();

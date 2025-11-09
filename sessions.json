@@ -15,10 +15,10 @@
         "playFlow": null,
         "awaitingWalletAddress": false,
         "currentPlay": {
-          "matchId": "m-136348",
+          "matchId": "m-137140",
           "marketType": "PreMatch",
-          "playOption": "Under 300 Runs",
-          "matchName": "Boland vs Titans"
+          "playOption": "Over 300 Runs",
+          "matchName": "Kuwait vs Afghanistan"
         }
       }
     },
@@ -32,6 +32,12 @@
           "betOption": "Team B to Win",
           "startedAt": 1761505603913,
           "completed": false
+        },
+        "currentPlay": {
+          "matchId": "m-137140",
+          "marketType": "PreMatch",
+          "playOption": "Over 300 Runs",
+          "matchName": "Kuwait vs Afghanistan"
         }
       }
     },

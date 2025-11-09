@@ -1,5 +1,13 @@
 // ============================================================
-// 🏏 Upcoming Match Fetcher — Upsert + Logging Edition (v3.1)
+// 🏏 Unified Match Fetcher — Upcoming + Live Upsert (v4.0)
+// ============================================================
+//
+// Purpose:
+// • Fetches both upcoming and live matches via Cricbuzz RapidAPI
+// • Merges both result sets into one uniform structure
+// • Upserts into DB safely with cooldown + lock + retry
+//
+// Author: Artham Bhardwaj
 // ============================================================
 
 import { pool } from "../db/db.js";
@@ -10,7 +18,8 @@ import url from "url";
 import fs from "fs";
 import os from "os";
 
-import { fetchUpcomingMatches } from "./fetchUpcoming.js"; // ✅ Only this fetcher is used now
+import { fetchUpcomingMatches } from "./fetchUpcoming.js";
+import { fetchLiveMatches } from "./fetchLive.js";
 
 const logger = customLogger || console;
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -100,26 +109,26 @@ async function runWithBackoff(label, fn, attempt = 1) {
 }
 
 // ============================================================
-// 🏏 Main Function — Fetch ONLY Upcoming Matches
+// 🏏 Main Function — Fetch BOTH Upcoming and Live Matches
 // ============================================================
-export async function ensureUpcomingMatches() {
+export async function ensureAllMatches() {
   // 🧱 Prevent overlapping runs
   if (fs.existsSync(LOCK_FILE)) {
     const mtime = fs.statSync(LOCK_FILE).mtimeMs;
     const age = Date.now() - mtime;
     if (age < 2 * 60 * 1000) {
-      logger.warn("⚠️ [FetchUpcoming] Skipped — another fetch still running.");
+      logger.warn("⚠️ [FetchAll] Skipped — another fetch still running.");
       return "skipped_overlap";
     }
     if (age > 10 * 60 * 1000) {
-      logger.warn("🧹 [FetchUpcoming] Removing stale lock file (>10 min old).");
+      logger.warn("🧹 [FetchAll] Removing stale lock file (>10 min old).");
       fs.unlinkSync(LOCK_FILE);
     }
   }
 
-  // 🕒 Enforce 15-minute cooldown
+  // 🕒 Enforce cooldown
   if (!canFetchAgain(15)) {
-    logger.info("🕒 [FetchUpcoming] Skipped — cooldown active (≤15 min).");
+    logger.info("🕒 [FetchAll] Skipped — cooldown active (≤15 min).");
     return "skipped_cooldown";
   }
 
@@ -127,13 +136,18 @@ export async function ensureUpcomingMatches() {
   markFetchTime();
 
   const start = Date.now();
-  logger.info("⚡ [FetchUpcoming] Starting fetch of upcoming matches…");
+  logger.info("⚡ [FetchAll] Starting fetch of upcoming + live matches…");
 
   try {
-    const matches = await runWithBackoff("Upcoming", fetchUpcomingMatches);
+    // 🧩 Fetch both concurrently
+    const [upcoming, live] = await Promise.all([
+      runWithBackoff("Upcoming", fetchUpcomingMatches),
+      runWithBackoff("Live", fetchLiveMatches),
+    ]);
 
-    if (!matches?.length) {
-      logger.warn("⚠️ [FetchUpcoming] No matches fetched — check endpoint.");
+    const matches = [...(upcoming || []), ...(live || [])];
+    if (!matches.length) {
+      logger.warn("⚠️ [FetchAll] No matches fetched — check endpoints.");
       return "no_matches";
     }
 
@@ -191,13 +205,13 @@ export async function ensureUpcomingMatches() {
             m.country ?? "",
             m.status ?? "upcoming",
             m.timezone ?? "+05:30",
-            "upcoming",
+            m.status === "live" ? "live" : "upcoming",
           ]);
 
           if (res.rowCount > 0) inserted++;
           else updated++;
         } catch (e) {
-          logger.error(`❌ [FetchUpcoming] Insert failed ${m.match_id}: ${e.message}`);
+          logger.error(`❌ [FetchAll] Insert failed ${m.match_id}: ${e.message}`);
         }
       }
 
@@ -207,14 +221,16 @@ export async function ensureUpcomingMatches() {
       const check = await client.query("SELECT COUNT(*) FROM matches");
       const count = check.rows[0].count;
 
-      logger.info(`💾 [FetchUpcoming] Inserted/updated ${total} (${inserted} new). DB now has ${count} total.`);
-      logger.info(`⏱️ [FetchUpcoming] Completed in ${dur}s.`);
+      logger.info(
+        `💾 [FetchAll] Inserted/updated ${total} (${inserted} new). DB now has ${count} total.`
+      );
+      logger.info(`⏱️ [FetchAll] Completed in ${dur}s.`);
       return `inserted ${inserted}, updated ${updated}, total ${count}`;
     } finally {
       client.release();
     }
   } catch (e) {
-    logger.error(`🚨 [FetchUpcoming] Fatal error: ${e.message}`);
+    logger.error(`🚨 [FetchAll] Fatal error: ${e.message}`);
     return `error: ${e.message}`;
   } finally {
     if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
@@ -227,8 +243,8 @@ export async function ensureUpcomingMatches() {
 const currentFile = url.fileURLToPath(import.meta.url);
 if (path.resolve(currentFile) === path.resolve(process.argv[1])) {
   (async () => {
-    logger.info("🧪 [CLI] Running ensureUpcomingMatches() manually…");
-    const summary = await ensureUpcomingMatches();
+    logger.info("🧪 [CLI] Running ensureAllMatches() manually…");
+    const summary = await ensureAllMatches();
     logger.info(`🏁 [CLI] Done. Summary: ${summary}`);
     process.exit(0);
   })();

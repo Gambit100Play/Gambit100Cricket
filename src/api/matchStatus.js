@@ -1,48 +1,57 @@
-// src/api/matchStatus.js
+// ============================================================
+// 🏏 Cricbuzz Match Status Module (v3.0 — Unified Parser)
+// ============================================================
+//
+// Handles both active/live and archived Cricbuzz match responses
+// via RapidAPI, automatically normalizing fields for crons.
+//
+// Works for endpoints returning either:
+//   { matchHeader: {...}, liveSummary: {...} }  ← active
+//   or
+//   { matchid, team1, team2, state, tossstatus } ← completed
+// ============================================================
+
 import axios from "axios";
 
 /* ============================================================
- ⚡ Cricbuzz API Client (via RapidAPI)
+ ⚡ Cricbuzz API Client (with auto-fallback between hosts)
 ============================================================ */
 async function fetchFromCricbuzz(matchId) {
-  const url = `https://cricbuzz-cricket2.p.rapidapi.com/mcenter/v1/${matchId}`;
-  console.info(`[fetchFromCricbuzz] 🌐 Request → ${url}`);
+  if (!matchId) throw new Error("❌ matchId is required");
 
-  try {
-    const start = Date.now();
-    const response = await axios.get(url, {
-      headers: {
-        "x-rapidapi-key": process.env.RAPIDAPI_KEY,
-        "x-rapidapi-host": "cricbuzz-cricket2.p.rapidapi.com",
-      },
-      timeout: 15000,
-    });
+  const hosts = [
+    "cricbuzz-cricket2.p.rapidapi.com",
+    "cricbuzz-cricket.p.rapidapi.com"
+  ];
 
-    const ms = Date.now() - start;
-    console.info(
-      `[fetchFromCricbuzz] ✅ Received match=${matchId} (${ms} ms, ${JSON.stringify(
-        response.data?.matchHeader?.state || "no state"
-      )})`
-    );
-    return response.data;
-  } catch (err) {
-    console.error(
-      `[fetchFromCricbuzz] ❌ Failed for match=${matchId}: ${err.message}`
-    );
-    if (err.response) {
-      console.error(
-        `[fetchFromCricbuzz] ↳ Status=${err.response.status} | Data=${JSON.stringify(
-          err.response.data
-        )}`
-      );
+  for (const host of hosts) {
+    const url = `https://${host}/mcenter/v1/${matchId}`;
+    console.info(`[fetchFromCricbuzz] 🌐 Request → ${url}`);
+    try {
+      const start = Date.now();
+      const response = await axios.get(url, {
+        headers: {
+          "x-rapidapi-key": process.env.RAPIDAPI_KEY,
+          "x-rapidapi-host": host,
+        },
+        timeout: 15000,
+      });
+      const ms = Date.now() - start;
+      const state = response.data?.matchHeader?.state || response.data?.state || "no state";
+      console.info(`[fetchFromCricbuzz] ✅ ${host} responded (${ms} ms) → state="${state}"`);
+      return response.data;
+    } catch (err) {
+      console.warn(`[fetchFromCricbuzz] ⚠️ ${host} failed for match=${matchId}: ${err.message}`);
     }
-    return null;
   }
+
+  console.error(`[fetchFromCricbuzz] ❌ Both hosts failed for match=${matchId}`);
+  return null;
 }
 
 /* ============================================================
  🏏 fetchMatchDetails(matchId)
- Returns structured match info (state, toss, overs, etc.)
+ Returns normalized structured match info
 ============================================================ */
 export async function fetchMatchDetails(matchId) {
   if (!matchId) throw new Error("❌ matchId is required");
@@ -56,40 +65,57 @@ export async function fetchMatchDetails(matchId) {
       return null;
     }
 
-    // Defensive parsing
-    const header = data.matchHeader || {};
+    // 🧩 Detect response type
+    const isMcenter = !!data.matchHeader;
+    const header = isMcenter ? data.matchHeader : {};
     const liveSummary = data.liveSummary || data.liveScore || {};
 
-    const rawState = header.state || data.state || "Unknown";
-    const rawToss =
-      header.tossResults?.tossWinnerName && header.tossResults?.decision
-        ? `${header.tossResults.tossWinnerName} opt to ${header.tossResults.decision}`
-        : data.tossstatus || "";
+    // Extract core fields safely
+    const rawState = (isMcenter ? header.state : data.state) || "Unknown";
+    const rawToss = isMcenter
+      ? (header.tossResults?.tossWinnerName && header.tossResults?.decision
+          ? `${header.tossResults.tossWinnerName} opt to ${header.tossResults.decision}`
+          : data.tossstatus || "")
+      : data.tossstatus || "";
 
-    const team1 = header.team1?.name || data.team1?.teamName || "";
-    const team2 = header.team2?.name || data.team2?.teamName || "";
+    const team1 = isMcenter
+      ? header.team1?.name || ""
+      : data.team1?.teamname || data.team1?.teamName || "";
+    const team2 = isMcenter
+      ? header.team2?.name || ""
+      : data.team2?.teamname || data.team2?.teamName || "";
+
     const innings = Number(liveSummary?.inningsId || 0);
     const overs = Number(liveSummary?.overs || 0);
 
-    // Normalize paused “in progress” states
-    const pausedStates = [
-      "stumps",
-      "tea",
-      "lunch",
-      "innings break",
-      "drinks",
-      "in progress",
-    ];
-    const state = pausedStates.includes(rawState.toLowerCase())
-      ? "In Progress"
-      : rawState;
+    // Normalize states
+    const normalized = rawState.toLowerCase();
+    let state = "Unknown";
+    if (["stumps", "tea", "lunch", "innings break", "drinks", "in progress"].includes(normalized)) {
+      state = "In Progress";
+    } else if (["complete", "completed"].includes(normalized)) {
+      state = "Completed";
+    } else if (["upcoming", "preview", "scheduled"].includes(normalized)) {
+      state = "Upcoming";
+    } else if (["toss", "toss delayed"].includes(normalized) || rawToss.toLowerCase().includes("opt to")) {
+      state = "Toss";
+    } else {
+      state = rawState;
+    }
 
     const resultText =
       header.result?.result ||
       data.shortstatus ||
       data.statusText ||
+      data.status ||
       header.status ||
       "";
+
+    // Winner extraction fallback
+    const winner =
+      header.winnerTeam ||
+      header.matchResult ||
+      (resultText.includes("won") ? resultText.split(" won")[0] : "");
 
     console.debug(
       `[matchStatus] 📊 Parsed matchId=${matchId} | state=${state} | toss='${rawToss}' | overs=${overs} | innings=${innings}`
@@ -114,12 +140,10 @@ export async function fetchMatchDetails(matchId) {
       team2,
       innings,
       overs,
-      winner: header.winnerTeam || header.matchResult || "",
+      winner,
     };
   } catch (err) {
-    console.error(
-      `[matchStatus] ❌ fetchMatchDetails failed for ${matchId}: ${err.message}`
-    );
+    console.error(`[matchStatus] ❌ fetchMatchDetails failed for ${matchId}: ${err.message}`);
     return null;
   }
 }
@@ -148,13 +172,10 @@ export async function getMatchStatusSummary(matchId) {
 
   const normalizedState = (details.state || "unknown").toLowerCase();
 
-  // Extract rough indicators from match score string (optional fallback)
-  let runs = 0,
-    wickets = 0,
-    boundaries = 0;
+  // Rough run/wicket extraction for quick logs
+  let runs = 0, wickets = 0, boundaries = 0;
   try {
-    const scoreMatch = (details.resultText || "")
-      .match(/(\d+)\/(\d+)/); // like "120/3"
+    const scoreMatch = (details.resultText || "").match(/(\d+)\/(\d+)/);
     if (scoreMatch) {
       runs = Number(scoreMatch[1]);
       wickets = Number(scoreMatch[2]);

@@ -1,4 +1,4 @@
-// src/scripts/fetchLiveScore.js
+// src/api/fetchLiveScore.js
 import axios from "axios";
 import dotenv from "dotenv";
 import { query } from "../db/db.js";

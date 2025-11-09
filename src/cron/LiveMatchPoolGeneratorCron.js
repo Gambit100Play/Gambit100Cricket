@@ -1,4 +1,13 @@
-// src/cron/LiveMatchPoolGeneratorCron.js
+// ============================================================
+// 🏏 LiveMatchPoolGeneratorCron — Per-Match Smart Mode (v4.2 Stable)
+// ============================================================
+//
+// • Starts per-match when match becomes locked_pre
+// • Runs every 2 min until match completes
+// • Fetches live state via fetchLiveScore()
+// • Locks previous pools, creates new ones per 5 overs
+// ============================================================
+
 import cron from "node-cron";
 import crypto from "crypto";
 import { DateTime } from "luxon";
@@ -10,21 +19,31 @@ import { logger } from "../utils/logger.js";
 
 dotenv.config();
 
-logger.info("🏏 [Cron] LiveMatchPoolGeneratorCron initialized (Auto-Lock Mode + LiveScore Integration).");
+const activeJobs = new Map();
+logger.info("🏏 [Cron] LiveMatchPoolGeneratorCron v4.2 initialized.");
 
-/* 🔐 Hash Generator */
-function createPoolHash(pool) {
-  const payload = {
-    category: pool.category,
-    threshold: pool.threshold,
-    start_over: pool.start_over,
-    end_over: pool.end_over,
-    options: pool.options,
-  };
-  return crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+// ============================================================
+// 🔐 Hash Generator
+// ============================================================
+function makeHash(pool) {
+  return crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        matchid: pool.matchid,
+        category: pool.category,
+        start_over: pool.start_over,
+        end_over: pool.end_over,
+        threshold: pool.threshold,
+        options: pool.options,
+      })
+    )
+    .digest("hex");
 }
 
-/* 📈 Threshold Estimator */
+// ============================================================
+// 📈 Threshold Estimator (adaptive)
+// ============================================================
 function estimateThreshold(category, stats, endOver) {
   const { runs = 0, overs = 0, wickets = 0, boundaries = 0 } = stats;
   const runRate = overs > 0 ? runs / overs : 6.0;
@@ -42,128 +61,176 @@ function estimateThreshold(category, stats, endOver) {
   }
 }
 
-/* 🔒 Lock previous pool */
-async function lockPreviousPool(matchId, prevEndOver) {
+// ============================================================
+// 🔒 Lock previous 5-over window pools (Fixed)
+// ============================================================
+async function lockPreviousPools(matchId, prevEndOver) {
   try {
     const { rows } = await query(
-      `SELECT id, category, threshold, start_over, end_over, options
-       FROM live_pools
-       WHERE matchid=$1 AND end_over=$2 AND status='active'`,
+      `SELECT * FROM live_pools WHERE matchid=$1 AND end_over=$2 AND status='active'`,
       [matchId, prevEndOver]
     );
 
     if (!rows.length) return;
 
+    const network = (process.env.NETWORK || "").toLowerCase();
+
     for (const pool of rows) {
-      const poolHash = createPoolHash(pool);
+      const hash = makeHash(pool);
       let txid = "LOCAL_TEST_TXID";
-      const network = (process.env.NETWORK || "").toLowerCase();
 
       if (["shasta", "mainnet"].includes(network)) {
         try {
-          txid = await publishHashToTron(poolHash);
-          logger.info(`🔗 [TRON] Published hash for pool=${pool.id}, txid=${txid}`);
+          txid = await publishHashToTron(hash);
+          logger.info(`🔗 [TRON] Published hash for pool ${pool.id} → txid=${txid}`);
         } catch (err) {
-          logger.warn(`⚠️ [TRON] Publish failed for pool=${pool.id}: ${err.message}`);
+          logger.warn(`⚠️ [TRON] Publish failed for pool ${pool.id}: ${err.message}`);
         }
-      } else {
-        logger.debug(`🧪 [MockTRON] Skipping publish for pool ${pool.id}`);
       }
 
+      // ✅ Corrected parameterized UPDATE (no bind mismatch)
       await query(
-        `UPDATE live_pools 
-           SET status='locked', locked_at=NOW(), pool_hash=$1, tron_txid=$2
-         WHERE id=$3`,
-        [poolHash, txid, pool.id]
+        `UPDATE live_pools
+           SET status='locked',
+               locked_at=NOW(),
+               pool_hash=$1,
+               tron_txid=$2,
+               updated_at=NOW()
+         WHERE id=$3;`,
+        [hash || null, txid || null, pool.id]
       );
 
-      logger.info(`🔒 [AutoLock] Locked [${pool.category}] (${pool.start_over}-${pool.end_over}) for match ${matchId}`);
+      logger.info(
+        `🔒 [AutoLock] Locked pool_id=${pool.id} (${pool.category} ${pool.start_over}-${pool.end_over}) for match ${matchId}`
+      );
     }
   } catch (err) {
-    logger.error(`❌ [lockPreviousPool] match=${matchId}: ${err.message}`);
+    logger.error(`❌ [lockPreviousPools] match=${matchId} → ${err.message}`);
   }
 }
 
-/* 🧩 Cron Job — Every 2 min */
-cron.schedule("0 6/18 * * *", async () => {
+// ============================================================
+// 🧩 Generate Pools for ONE match
+// ============================================================
+async function generateLivePoolsForMatch(rawId) {
+  const matchId = parseInt(String(rawId).replace(/^m-/, "").trim(), 10);
   const now = DateTime.now().setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
-  logger.info(`[LiveMatchPoolGeneratorCron] Tick → ${now}`);
+  logger.info(`\n[LiveMatchPoolGeneratorCron] Tick → ${now} | match=${matchId}`);
 
-  try {
-    const liveMatches = await query(`
-      SELECT match_id, team1, team2
-      FROM matches
-      WHERE LOWER(status) IN ('live', 'in progress')
-    `);
+  const { rows: matchRows } = await query(
+    `SELECT team1, team2, status FROM matches WHERE match_id=$1`,
+    [matchId]
+  );
 
-    if (!liveMatches.rows.length) {
-      logger.info("✅ No live matches currently running.");
-      return;
-    }
+  if (!matchRows.length) {
+    logger.warn(`[${matchId}] Match not found in DB — stopping job.`);
+    stopLivePoolCron(matchId);
+    return;
+  }
 
-    for (const match of liveMatches.rows) {
-      logger.info(`➡️ [Check] ${match.team1} vs ${match.team2} (${match.match_id})`);
+  const { team1, team2, status } = matchRows[0];
+  logger.info(`➡️ [Match] ${team1} vs ${team2} (${matchId}) | status=${status}`);
 
-      // ✅ Step 1: Fetch & update live score from API (reusing fetchLiveScore.js)
-      const stats = await fetchLiveScore(match.match_id);
-      if (!stats) continue;
+  // ✅ Fetch live score
+  const stats = await fetchLiveScore(matchId);
+  if (!stats) {
+    logger.warn(`[${matchId}] fetchLiveScore() returned null — retry next tick.`);
+    return;
+  }
 
-      const currentOver = Math.floor(stats.overs || 0);
-      if (currentOver <= 0) {
-        logger.debug(`⏳ Match not started yet.`);
-        continue;
-      }
+  const { overs = 0, state } = stats;
+  const normalizedState = (state || "").toLowerCase();
 
-      // ✅ Step 2: Determine overs
-      const endOver = Math.ceil((currentOver + 1) / 2) * 2;
-      const startOver = Math.max(0, endOver - 2);
-      const prevEndOver = endOver - 2;
+  // 🏁 Stop if match completed
+  if (["complete", "completed", "result", "innings break"].some((s) => normalizedState.includes(s))) {
+    logger.info(`🏁 [${matchId}] Match completed — stopping pool generation.`);
+    await query(`UPDATE matches SET status='completed', updated_at=NOW() WHERE match_id=$1`, [matchId]);
+    stopLivePoolCron(matchId);
+    return;
+  }
 
-      logger.info(
-        `📊 [Stats] overs=${stats.overs}, runs=${stats.runs}, wkts=${stats.wickets}, bounds=${stats.boundaries}`
-      );
+  if (overs <= 0) {
+    logger.debug(`⏳ [${matchId}] Match not yet started (overs=${overs}).`);
+    return;
+  }
 
-      // ✅ Step 3: Lock finished pool
-      await lockPreviousPool(match.match_id, prevEndOver);
+  const currentOver = Math.floor(overs);
+  const endOver = Math.ceil((currentOver + 1) / 5) * 5;
+  const startOver = Math.max(0, endOver - 5);
+  const prevEndOver = endOver - 5;
 
-      // ✅ Step 4: Skip if pool already exists
-      const { rows: exists } = await query(
-        `SELECT id FROM live_pools WHERE matchid=$1 AND end_over=$2`,
-        [match.match_id, endOver]
-      );
-      if (exists.length) {
-        logger.debug(`⏳ Pool for ${endOver} overs already exists.`);
-        continue;
-      }
+  logger.info(
+    `📊 [Stats ${matchId}] overs=${overs}, runs=${stats.runs}, wkts=${stats.wickets}, bounds=${stats.boundaries}`
+  );
 
-      // ✅ Step 5: Create new pool
-      const categories = ["score", "wickets", "boundaries"];
-      for (const category of categories) {
-        const threshold = estimateThreshold(category, stats, endOver);
-        const options = {
-          over: 0,
-          under_equal: 0,
-          current_runs: stats.runs,
-          current_wickets: stats.wickets,
-          current_boundaries: stats.boundaries,
-          current_over: stats.overs,
-          projected_runs: Math.round((stats.runs / (stats.overs || 1)) * endOver),
-          last_updated_at: new Date().toISOString(),
-        };
+  await lockPreviousPools(matchId, prevEndOver);
 
-        await query(
-          `INSERT INTO live_pools
-             (matchid, category, start_over, end_over, threshold, options)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [match.match_id, category, startOver, endOver, threshold, JSON.stringify(options)]
-        );
+  // Avoid duplicate active pool
+  const { rows: existing } = await query(
+    `SELECT id FROM live_pools WHERE matchid=$1 AND start_over=$2 AND end_over=$3 AND status='active'`,
+    [matchId, startOver, endOver]
+  );
 
-        logger.info(`🎯 [${category}] Created pool for overs ${startOver}-${endOver} → threshold=${threshold}`);
-      }
-    }
-  } catch (err) {
-    logger.error(`🚨 [LiveMatchPoolGeneratorCron] Fatal: ${err.message}`);
+  if (existing.length) {
+    logger.debug(`⏳ [${matchId}] Active pool already exists for ${startOver}-${endOver}`);
+    return;
+  }
+
+  // ✅ Create new active pools
+  const categories = ["score", "wickets", "boundaries"];
+  for (const category of categories) {
+    const threshold = estimateThreshold(category, stats, endOver);
+    const options = {
+      current_runs: stats.runs,
+      current_wickets: stats.wickets,
+      current_boundaries: stats.boundaries,
+      current_over: stats.overs,
+      projected_runs: Math.round((stats.runs / Math.max(stats.overs, 1)) * endOver),
+      last_updated_at: new Date().toISOString(),
+    };
+
+    await query(
+      `INSERT INTO live_pools
+         (matchid, category, start_over, end_over, threshold, options, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW(), NOW());`,
+      [matchId, category, startOver, endOver, threshold, JSON.stringify(options)]
+    );
+
+    logger.info(
+      `🎯 [${matchId}] [${category}] New pool → overs ${startOver}-${endOver}, threshold=${threshold}`
+    );
   }
 
   logger.info("──────────────────────────────────────────────");
-});
+}
+
+// ============================================================
+// ⏰ Start / Stop Per-Match
+// ============================================================
+export function startLivePoolCron(matchId) {
+  const numericId = parseInt(String(matchId).replace(/^m-/, "").trim(), 10);
+  if (activeJobs.has(numericId)) {
+    logger.info(`⚙️ [LivePoolCron] Already running for match ${numericId}`);
+    return;
+  }
+
+  logger.info(`🟢 [LivePoolCron] Starting 2-min cron for match ${numericId}`);
+  const job = cron.schedule(
+    "*/2 * * * *",
+    () => generateLivePoolsForMatch(numericId),
+    { timezone: "Asia/Kolkata" }
+  );
+
+  activeJobs.set(numericId, job);
+  job.start();
+}
+
+export function stopLivePoolCron(matchId) {
+  const numericId = parseInt(String(matchId).replace(/^m-/, "").trim(), 10);
+  const job = activeJobs.get(numericId);
+  if (job) {
+    job.stop();
+    activeJobs.delete(numericId);
+    logger.info(`🔴 [LivePoolCron] Stopped for match ${numericId}`);
+  }
+}
