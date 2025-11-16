@@ -1,5 +1,6 @@
 // =====================================================
-// 🧠 NEW USER HANDLER — Auto Registration + Deposit Wallet Creation (v4.1 FINAL — Markdown-Stable)
+// 🧠 NEW USER HANDLER — Auto Registration + HD Deposit Wallet Creation
+// (v6.1 — Deterministic, Unique Index via wallet_sequence, Markdown-Safe)
 // =====================================================
 import {
   createOrUpdateUser,
@@ -8,11 +9,14 @@ import {
   query,
 } from "../../db/db.js";
 import { logger } from "../../utils/logger.js";
-import { getOrCreateDepositAddress } from "../../utils/generateDepositAddress.js";
 import { safeMarkdown } from "../../utils/markdown.js";
+import {
+  initMasterWallet,
+  deriveDepositAddress,
+} from "../../wallet/masterWallet.js";
 
-// 🧩 In-memory cooldown to prevent spammy DB writes
 const recentActivityCache = new Map(); // telegramId → timestamp
+let walletInitialized = false;
 
 export default function newUserHandler(bot) {
   bot.use(async (ctx, next) => {
@@ -20,9 +24,9 @@ export default function newUserHandler(bot) {
       if (!ctx?.from?.id) return await next();
       const telegramId = ctx.from.id;
 
-      // =====================================================
-      // 🧰 Safe Markdown Wrapper (prevents double escaping)
-      // =====================================================
+      // ──────────────────────────────────────────────
+      // 🧰 Safe Markdown Wrapper
+      // ──────────────────────────────────────────────
       const originalReply = ctx.reply.bind(ctx);
       ctx.reply = async (text, opts = {}) => {
         try {
@@ -30,72 +34,37 @@ export default function newUserHandler(bot) {
           const alreadyEscaped =
             typeof text === "string" &&
             (text.includes("\\_") ||
-             text.includes("\\-") ||
-             text.includes("\\(") ||
-             text.includes("\\*") ||
-             text.includes("\\[") ||
-             text.includes("\\]") ||
-             opts.__escaped);
-
+              text.includes("\\-") ||
+              text.includes("\\(") ||
+              text.includes("\\*") ||
+              text.includes("\\[") ||
+              text.includes("\\]") ||
+              opts.__escaped);
           if (isMarkdown && typeof text === "string" && !alreadyEscaped) {
             text = safeMarkdown(text);
           }
-
           return await originalReply(text, opts);
         } catch (err) {
           if (err.message?.includes("can't parse entities")) {
-            logger.warn(
-              "⚠️ [SafeReply] Telegram Markdown parse error suppressed (fallback to plain text)."
-            );
+            logger.warn("⚠️ [SafeReply] Markdown parse error suppressed.");
             return await originalReply(String(text), { parse_mode: undefined });
           }
           throw err;
         }
       };
 
-      const originalEdit = ctx.editMessageText?.bind(ctx);
-      ctx.editMessageText = async (text, opts = {}) => {
-        try {
-          const isMarkdown = opts?.parse_mode === "MarkdownV2";
-          const alreadyEscaped =
-            typeof text === "string" &&
-            (text.includes("\\_") ||
-             text.includes("\\-") ||
-             text.includes("\\(") ||
-             text.includes("\\*") ||
-             text.includes("\\[") ||
-             text.includes("\\]") ||
-             opts.__escaped);
-
-          if (isMarkdown && typeof text === "string" && !alreadyEscaped) {
-            text = safeMarkdown(text);
-          }
-
-          return await originalEdit(text, opts);
-        } catch (err) {
-          if (err.message?.includes("can't parse entities")) {
-            logger.warn(
-              "⚠️ [SafeEdit] Telegram Markdown parse error suppressed (fallback to plain text)."
-            );
-            return await originalEdit(String(text), { parse_mode: undefined });
-          }
-          throw err;
-        }
-      };
-
-      // =====================================================
-      // 🕒 30-second cooldown to avoid redundant DB writes
-      // =====================================================
+      // ──────────────────────────────────────────────
+      // 🕒 Cooldown (30 s) to avoid redundant writes
+      // ──────────────────────────────────────────────
       const now = Date.now();
       const lastSeen = recentActivityCache.get(telegramId);
       if (lastSeen && now - lastSeen < 30_000) return await next();
       recentActivityCache.set(telegramId, now);
 
-      // =====================================================
-      // 1️⃣ Register or update user
-      // =====================================================
+      // ──────────────────────────────────────────────
+      // 👤 1️⃣ Register or update user
+      // ──────────────────────────────────────────────
       let user = await getUserById(telegramId);
-
       if (!user) {
         await createOrUpdateUser(
           telegramId,
@@ -104,43 +73,62 @@ export default function newUserHandler(bot) {
           ctx.from.last_name || ""
         );
         logger.info(`👋 [NewUser] Registered new user ${telegramId}`);
+        user = await getUserById(telegramId);
       } else {
         await updateUserActivity(telegramId);
       }
 
-      // =====================================================
-      // 2️⃣ Ensure TRON deposit wallet exists
-      // =====================================================
-      const walletInfo = await getOrCreateDepositAddress(telegramId);
-      let address = walletInfo?.address;
-      const derivationIndex = walletInfo?.derivationIndex ?? "?";
-
-      if (address && typeof address !== "string") {
-        try {
-          const parsed = JSON.parse(address);
-          if (parsed?.address) address = parsed.address;
-        } catch {
-          /* ignore malformed JSON */
-        }
+      // ──────────────────────────────────────────────
+      // 🔑 2️⃣ Ensure master wallet initialized once
+      // ──────────────────────────────────────────────
+      if (!walletInitialized) {
+        await initMasterWallet({ generateIfMissing: true });
+        walletInitialized = true;
+        logger.info("🔑 [MasterWallet] Initialized successfully (cached).");
       }
 
+      // ──────────────────────────────────────────────
+      // 💎 3️⃣ Determine or allocate unique derivation index
+      // ──────────────────────────────────────────────
+      let derivationIndex = user?.derivation_index;
+      if (derivationIndex === null || derivationIndex === undefined) {
+        // create sequence table if it doesn't exist
+        await query(`
+          CREATE TABLE IF NOT EXISTS wallet_sequence (
+            id SERIAL PRIMARY KEY
+          );
+        `);
+
+        const { rows } = await query(`
+          INSERT INTO wallet_sequence DEFAULT VALUES
+          RETURNING id AS next_index;
+        `);
+        derivationIndex = rows[0].next_index;
+      }
+
+      // ──────────────────────────────────────────────
+      // 💰 4️⃣ Derive deterministic deposit address
+      // ──────────────────────────────────────────────
+      const { address } = deriveDepositAddress(derivationIndex);
       if (!address || !address.startsWith("T")) {
-        throw new Error(`Invalid or missing TRON address for user ${telegramId}`);
+        throw new Error(`Invalid TRON address derived for user ${telegramId}`);
       }
 
-      // Update only if changed
+      // ──────────────────────────────────────────────
+      // 🗄️ 5️⃣ Save deposit info (no private key)
+      // ──────────────────────────────────────────────
       await query(
         `UPDATE users
            SET deposit_address = $1,
+               derivation_index = $2,
                last_active = NOW()
-         WHERE telegram_id = $2
-           AND (deposit_address IS NULL OR deposit_address != $1)`,
-        [address, telegramId]
+         WHERE telegram_id = $3`,
+        [address, derivationIndex, telegramId]
       );
 
-      // =====================================================
-      // 3️⃣ Notify new user (HTML-safe)
-      // =====================================================
+      // ──────────────────────────────────────────────
+      // 📩 6️⃣ Notify user (first-time setup)
+      // ──────────────────────────────────────────────
       if (!user?.deposit_address) {
         try {
           await ctx.reply(
@@ -158,29 +146,12 @@ export default function newUserHandler(bot) {
         `💰 [NewUser] Deposit ensured for ${telegramId}: ${address} [index=${derivationIndex}]`
       );
 
-      // =====================================================
-      // 4️⃣ Continue downstream safely
-      // =====================================================
-      try {
-        await next();
-      } catch (innerErr) {
-        if (innerErr.message?.includes("can't parse entities")) {
-          logger.warn(
-            "⚠️ [NewUserHandler] Ignored downstream Markdown parse warning (safe)."
-          );
-          return;
-        }
-        logger.warn(
-          `⚠️ [NewUserHandler] Downstream handler error ignored: ${innerErr.message}`
-        );
-      }
-
+      // ──────────────────────────────────────────────
+      // 🚦 7️⃣ Continue downstream safely
+      // ──────────────────────────────────────────────
+      await next();
     } catch (err) {
-      // =====================================================
-      // ❌ Wallet or DB failure
-      // =====================================================
       logger.error(`❌ [NewUserHandler] ${err.stack || err.message}`);
-
       try {
         await ctx.reply(
           safeMarkdown(

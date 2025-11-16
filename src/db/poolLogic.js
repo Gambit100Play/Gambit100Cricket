@@ -1,14 +1,11 @@
 // src/db/poolLogic.js
 import { query } from "./db.js";
 import { logger } from "../utils/logger.js";
+import poolCache from "../redis/poolCache.js";   // ✅ Correct cache module
 
 /**
  * ============================================================
- * 🔍 getPoolInfo()
- * Aggregates pool data from bets table (excluding cancelled/voided bets)
- *  - Computes participants, total stake, and distinct plays
- *  - Dynamically marks pool as 'active' or 'pending'
- *  - Used by odds engine + UI
+ * 🔍 getPoolInfo() — now using Redis caching (2 sec TTL)
  * ============================================================
  */
 export async function getPoolInfo(
@@ -20,13 +17,26 @@ export async function getPoolInfo(
   const matchIdText = String(matchId).trim();
   const poolTypeClean = poolType.replace(/\s+/g, "").toLowerCase();
 
+  const cacheKey = betOption
+    ? `poolinfo:${matchIdText}:${poolTypeClean}:${betOption}`
+    : `poolinfo:${matchIdText}:${poolTypeClean}`;
+
+  // ============================================================
+  // 🔥 Try Redis cache first (via poolCache.js)
+  // ============================================================
+  const cached = await poolCache.poolCacheGet(cacheKey);
+  if (cached) {
+    logger.debug(`⚡ [PoolCacheHit] ${cacheKey}`);
+    return cached;               // already parsed JSON
+  }
+
   logger.info(
     `🎯 [getPoolInfo] match=${matchIdText}, poolType=${poolTypeClean}, betOption=${betOption || "ALL"}`
   );
 
   try {
     // ============================================================
-    // CASE 1 — Single bet option aggregation
+    // CASE 1 — Single bet option
     // ============================================================
     if (betOption) {
       const sql = `
@@ -34,9 +44,9 @@ export async function getPoolInfo(
           COUNT(DISTINCT telegram_id) AS participants,
           COALESCE(SUM(stake), 0) AS total_stake
         FROM bets
-        WHERE TRIM(match_id)::text = $1
+        WHERE match_id::text = $1
           AND REPLACE(LOWER(market_type), ' ', '') = $2
-          AND LOWER(TRIM(bet_option)) = LOWER(TRIM($3))
+          AND LOWER(TRIM(bet_option::text)) = LOWER(TRIM($3))
           AND LOWER(status) NOT IN ('cancelled', 'voided')
       `;
       const res = await query(sql, [matchIdText, poolTypeClean, betOption]);
@@ -44,17 +54,14 @@ export async function getPoolInfo(
 
       const participants = Number(row.participants || 0);
       const totalStake = Number(row.total_stake || 0);
+
       const status = participants >= minNeeded ? "active" : "pending";
       const remaining = Math.max(minNeeded - participants, 0);
       const progressBlocks = Math.floor((participants / minNeeded) * 10);
       const progressBar =
         "▓".repeat(progressBlocks) + "░".repeat(10 - progressBlocks);
 
-      logger.info(
-        `📊 [getPoolInfo:Single] ${betOption}: ${participants} players, ${totalStake} G staked, status=${status}`
-      );
-
-      return {
+      const data = {
         rows: [row],
         participants,
         totalStake,
@@ -63,42 +70,42 @@ export async function getPoolInfo(
         progress: Math.min(100, Math.floor((participants / minNeeded) * 100)),
         progressBar,
       };
+
+      // Cache using poolCache.js
+      await poolCache.poolCacheSet(cacheKey, data, 2);
+      return data;
     }
 
     // ============================================================
-    // CASE 2 — Full match pool aggregation
+    // CASE 2 — Full pool aggregation
     // ============================================================
-
     const [playersRes, playsRes, stakesRes] = await Promise.all([
-      // 🎯 Unique players (excluding cancelled/voided)
       query(
         `SELECT COUNT(DISTINCT telegram_id) AS unique_players
          FROM bets
-         WHERE TRIM(match_id)::text = $1
+         WHERE match_id::text = $1
            AND REPLACE(LOWER(market_type), ' ', '') = $2
            AND LOWER(status) NOT IN ('cancelled', 'voided')`,
         [matchIdText, poolTypeClean]
       ),
 
-      // 🎯 Unique distinct bet options
       query(
-        `SELECT COUNT(DISTINCT LOWER(TRIM(bet_option))) AS unique_plays
+        `SELECT COUNT(DISTINCT LOWER(TRIM(bet_option::text))) AS unique_plays
          FROM bets
-         WHERE TRIM(match_id)::text = $1
+         WHERE match_id::text = $1
            AND REPLACE(LOWER(market_type), ' ', '') = $2
            AND LOWER(status) NOT IN ('cancelled', 'voided')`,
         [matchIdText, poolTypeClean]
       ),
 
-      // 🎯 Aggregated stake per option
       query(
         `SELECT 
-            LOWER(TRIM(bet_option)) AS key,
+            LOWER(TRIM(bet_option::text)) AS key,
             bet_option,
             COUNT(DISTINCT telegram_id) AS participants,
             COALESCE(SUM(stake), 0) AS total_stake
          FROM bets
-         WHERE TRIM(match_id)::text = $1
+         WHERE match_id::text = $1
            AND REPLACE(LOWER(market_type), ' ', '') = $2
            AND LOWER(status) NOT IN ('cancelled', 'voided')
          GROUP BY bet_option`,
@@ -110,7 +117,7 @@ export async function getPoolInfo(
     const uniquePlays = Number(playsRes.rows[0]?.unique_plays || 0);
     let rows = stakesRes.rows || [];
 
-    // 🧩 Always include baseline market options
+    // Add baseline options
     const defaultOptions = [
       "Team A to Win",
       "Team B to Win",
@@ -120,6 +127,7 @@ export async function getPoolInfo(
     ];
 
     const existingKeys = new Set(rows.map((r) => r.key));
+
     for (const opt of defaultOptions) {
       const key = opt.toLowerCase().trim();
       if (!existingKeys.has(key)) {
@@ -127,18 +135,11 @@ export async function getPoolInfo(
       }
     }
 
-    // 🧹 De-duplicate rows safely
-    const seen = new Set();
-    rows = rows.filter((r) => {
-      const k = r.key.toLowerCase();
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    });
+    rows = rows.filter((r, i, arr) => arr.findIndex(a => a.key === r.key) === i);
 
-    // 🧮 Compute totals and readiness
     const totalStake = rows.reduce((a, r) => a + Number(r.total_stake || 0), 0);
-    const minStakeThreshold = 100; // G-tokens threshold for activation
+
+    const minStakeThreshold = 100;
     const minUniquePlays = 3;
 
     const status =
@@ -151,11 +152,7 @@ export async function getPoolInfo(
     const progressBar =
       "▓".repeat(progressBlocks) + "░".repeat(10 - progressBlocks);
 
-    logger.info(
-      `🏊 [getPoolInfo:Full] ${uniquePlayers} players | ${uniquePlays} plays | ${totalStake}G staked | status=${status}`
-    );
-
-    return {
+    const data = {
       rows,
       participants: uniquePlayers,
       totalStake,
@@ -165,8 +162,13 @@ export async function getPoolInfo(
       progress: Math.min(100, Math.floor((uniquePlayers / minNeeded) * 100)),
       progressBar,
     };
+
+    // Cache result
+    await poolCache.poolCacheSet(cacheKey, data, 2);
+    return data;
+
   } catch (err) {
-    logger.error(`❌ [getPoolInfo] Failed for match ${matchId}: ${err.message}`);
+    logger.error(`❌ [getPoolInfo] Failed: ${err.message}`);
     return {
       rows: [],
       participants: 0,
@@ -180,14 +182,37 @@ export async function getPoolInfo(
   }
 }
 
+
 /**
  * ============================================================
- * 🧮 getPoolStatus()
- * Simple helper to decide pool readiness
+ * 🧮 getPoolStatus() — Cached (local + Redis)
  * ============================================================
  */
-export function getPoolStatus(participants, minNeeded = 10) {
+const localStatusCache = new Map();
+
+export async function getPoolStatus(participants, minNeeded = 10) {
+  const key = `poolstatus:${participants}:${minNeeded}`;
+
+  // 1️⃣ Local cache (fastest)
+  if (localStatusCache.has(key)) {
+    return localStatusCache.get(key);
+  }
+
+  // 2️⃣ Redis global cache
+  const cached = await poolCache.poolCacheGet(key);
+  if (cached) {
+    localStatusCache.set(key, cached);
+    return cached;
+  }
+
+  // 3️⃣ Fresh compute
   const status = participants >= minNeeded ? "active" : "pending";
+
   logger.debug(`⚙️ [getPoolStatus] participants=${participants}, status=${status}`);
+
+  // 4️⃣ Save into both caches
+  localStatusCache.set(key, status);
+  await poolCache.poolCacheSet(key, status, 2);
+
   return status;
 }

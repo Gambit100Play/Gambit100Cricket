@@ -1,5 +1,11 @@
 // ============================================================
-// 🏏 Pre-Match Bet Handler — Stable Logic (v3.5)
+// 🏏 Pre-Match Bet Handler — Unified with betHandler (v3.7)
+// ============================================================
+//
+// ✔ Stores pending bet in ctx.session.currentPlay
+// ✔ Uses unified "play_confirm_100g" button
+// ✔ Uses same stake model as LiveMatchBetHandler
+// ✔ Modular + safe — betting logic lives only in betHandler.js
 // ============================================================
 
 import { Markup } from "telegraf";
@@ -7,6 +13,7 @@ import { DateTime } from "luxon";
 import { getMatchById, getDynamicOdds, query } from "../../db/db.js";
 import { getPoolInfo } from "../../db/poolLogic.js";
 import { logger } from "../../utils/logger.js";
+
 
 global.matchIdMap = global.matchIdMap || new Map();
 
@@ -22,6 +29,7 @@ function formatStartIST(input) {
         : typeof input === "number"
         ? DateTime.fromMillis(input)
         : DateTime.fromISO(input.includes("T") ? input : input.replace(" ", "T"));
+
     return dt.setZone("Asia/Kolkata").toFormat("dd LLL yyyy, hh:mm a");
   } catch {
     return "Invalid Time";
@@ -35,7 +43,7 @@ async function buildPreMatchScreen(ctx, matchId) {
   const match = await getMatchById(matchId);
   if (!match) return ctx.reply("❌ Match not found in database.");
 
-  // ✅ Parse payload safely
+  // Parse payload safely
   let payload = {};
   try {
     payload =
@@ -51,14 +59,14 @@ async function buildPreMatchScreen(ctx, matchId) {
   const venue = payload?.venueInfo?.ground || match.venue || "Unknown Ground";
   const when = formatStartIST(match.start_time);
 
-  // 🏊 Get pool info
+  // Retrieve pool info
   const pool = await getPoolInfo(matchId, "PreMatch");
 
-  // 🎯 Count distinct bet options placed
+  // Count unique placed bets (for unlocking odds)
   const distinctRes = await query(
     `SELECT COUNT(DISTINCT LOWER(TRIM(bet_option))) AS unique_plays
-       FROM bets 
-      WHERE match_id=$1 
+       FROM bets
+      WHERE match_id=$1
         AND LOWER(market_type)=LOWER($2)
         AND status NOT IN ('Cancelled','Voided')`,
     [matchId, "PreMatch"]
@@ -68,7 +76,7 @@ async function buildPreMatchScreen(ctx, matchId) {
   const status = uniquePlays >= 3 ? "active" : "pending";
   const locked = pool?.status === "locked";
 
-  // 🎲 Odds calculation (only when 3+ distinct bets exist)
+  // Compute odds only if pool is active
   let oddsData = [];
   if (status === "active") {
     oddsData = await getDynamicOdds(matchId, "PreMatch");
@@ -78,18 +86,17 @@ async function buildPreMatchScreen(ctx, matchId) {
     (oddsData || []).map((o) => [o.bet_option.toLowerCase(), o.odds])
   );
 
-  // 👁️ Show odds only if pool is active (3+ distinct bet options)
   const showOdds = (opt) => {
     if (status !== "active") return "";
     const val = odds[opt.toLowerCase()];
     return val ? ` (${val}x)` : "";
   };
 
-  // 🧠 Map short ID for callback handling
+  // Create shortId for safe callback-data
   const shortId = String(matchId).slice(0, 8);
   global.matchIdMap.set(shortId, matchId);
 
-  // 🧱 Inline Keyboard Layout
+  // UI Buttons
   const buttons = locked
     ? [[Markup.button.callback("🔒 Predictions Locked", "noop_locked")]]
     : [
@@ -122,23 +129,18 @@ async function buildPreMatchScreen(ctx, matchId) {
         [Markup.button.callback("🔄 Refresh Pool", `refresh_pool_${shortId}`)],
       ];
 
-  // 🗣️ Build Message Text
   const header =
     `🟢 *Pre-Match Predictions* — ${match.name}\n\n` +
     `📅 *Scheduled:* ${when} IST\n` +
     `🏟️ *Venue:* ${venue}\n` +
     `🧾 *Format:* ${payload?.matchFormat || match.match_format || "Unknown"}\n\n`;
 
-  let poolStatusMsg = "";
-  if (locked) {
-    poolStatusMsg = "🔒 *Predictions Closed*\n\n";
-  } else if (status === "pending") {
-    poolStatusMsg =
-      "🚧 *Waiting for more players...*\n" +
-      "_Odds will unlock after at least 3 different bets are placed._\n\n";
-  } else {
-    poolStatusMsg = "✅ *Pool Active — Odds Live!*\n\n";
-  }
+  const poolStatusMsg =
+    locked
+      ? "🔒 *Predictions Closed*\n\n"
+      : status === "pending"
+      ? "🚧 *Waiting for more players...*\n_Odds unlock once 3 different bet options exist._\n\n"
+      : "✅ *Pool Active — Odds Live!*\n\n";
 
   const msg =
     header + poolStatusMsg + "Select a market below to lock your 100 G play.";
@@ -162,13 +164,15 @@ export async function startPreMatchBet(ctx, matchId) {
 }
 
 /* ------------------------------------------------------------
- 🧩 Handler Registration (Enhanced UX)
+ 🧩 Handler Registration
 ------------------------------------------------------------ */
 export default function preMatchBetHandler(bot) {
+
   // 🔄 Refresh pool
   bot.action(/^refresh_pool_(.+)/, async (ctx) => {
-    const id = ctx.match[1];
-    const matchId = global.matchIdMap.get(id) || id;
+    const shortId = ctx.match[1];
+    const matchId = global.matchIdMap.get(shortId) || shortId;
+
     try {
       await ctx.answerCbQuery("🔄 Refreshing...");
       await buildPreMatchScreen(ctx, matchId);
@@ -177,21 +181,26 @@ export default function preMatchBetHandler(bot) {
     }
   });
 
-  // 🎯 When user selects an option (market)
+  // 🎯 Selecting a pre-match option
   bot.action(/^play_prematch\|(.+)\|(.+)$/, async (ctx) => {
     try {
       const shortId = ctx.match[1];
       const playOption = decodeURIComponent(ctx.match[2]);
-      const matchId = global.matchIdMap.get(shortId) || shortId;
 
+      const matchId = global.matchIdMap.get(shortId) || shortId;
       const match = await getMatchById(matchId);
+
       if (!match) return ctx.reply("❌ Match not found.");
 
+      // ------------------------------------------------------------
+      // ⭐ Save pending bet for betHandler.js
+      // ------------------------------------------------------------
       ctx.session.currentPlay = {
         matchId,
         marketType: "PreMatch",
-        playOption,
+        playOption: playOption,
         matchName: match.name,
+        stake: 100, // ← required for betHandler
       };
 
       await ctx.reply(
@@ -211,10 +220,9 @@ export default function preMatchBetHandler(bot) {
     }
   });
 
-  // ❌ Cancel play confirmation
+  // ❌ Cancel active bet
   bot.action("cancel_play", async (ctx) => {
     try {
-      await ctx.deleteMessage().catch(() => null);
       ctx.session.currentPlay = null;
       await ctx.answerCbQuery("❌ Play cancelled.");
       await ctx.reply("✅ Play cancelled. You can choose another match anytime.");
@@ -223,7 +231,7 @@ export default function preMatchBetHandler(bot) {
     }
   });
 
-  // 🔒 Locked pool safeguard
+  // Locked pool safeguard
   bot.action("noop_locked", async (ctx) => {
     await ctx.answerCbQuery("🔒 Predictions closed after toss.");
   });

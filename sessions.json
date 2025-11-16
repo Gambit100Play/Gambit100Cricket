@@ -14,12 +14,7 @@
         "waitingForWallet": false,
         "playFlow": null,
         "awaitingWalletAddress": false,
-        "currentPlay": {
-          "matchId": "m-137140",
-          "marketType": "PreMatch",
-          "playOption": "Over 300 Runs",
-          "matchName": "Kuwait vs Afghanistan"
-        }
+        "currentPlay": null
       }
     },
     {

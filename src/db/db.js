@@ -2,7 +2,8 @@ import pkg from "pg";
 import dotenv from "dotenv";
 import { DateTime } from "luxon";
 import { getPoolInfo, getPoolStatus } from "./poolLogic.js";
-
+import redis from "../redis/index.js";
+import poolCache from "../redis/poolCache.js";  
 dotenv.config();
 const { Pool } = pkg;
 
@@ -21,8 +22,16 @@ console.log("Connected to PostgreSQL");
 // =====================================================
 // 🧩 Generic Query Helper
 // =====================================================
-export async function query(text, params) {
-  return pool.query(text, params);
+export async function query(text, params = []) {
+  try {
+    const result = await pool.query(text, params);
+    return result; // result.rows available for destructuring
+  } catch (err) {
+    console.error(`❌ [DB.query] SQL Error: ${err.message}`);
+    console.error(`🧩 Query: ${text}`);
+    console.error(`📦 Params: ${JSON.stringify(params)}`);
+    throw err;
+  }
 }
 // 👉 assumes you already export a `query` (pg Pool) somewhere
 //    and your table is named `matches` with id, status, result, winner, updated_at, completed_at.
@@ -147,14 +156,24 @@ export async function getUserWallet(telegramId, network = "TRON") {
 // 💰 BALANCES
 // =====================================================
 export async function getUserBalance(telegramId) {
+  const key = `userbal:${telegramId}`;
+
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
   const res = await pool.query(
     `SELECT tokens, bonus_tokens, usdt
-       FROM balances
-      WHERE telegram_id = $1`,
+       FROM balances WHERE telegram_id = $1`,
     [telegramId]
   );
-  return res.rows[0] || { tokens: 0, bonus_tokens: 0, usdt: 0 };
+
+  const data = res.rows[0] || { tokens: 0, bonus_tokens: 0, usdt: 0 };
+
+  await redis.set(key, JSON.stringify(data), { EX: 3 });
+
+  return data;
 }
+
 
 export async function updateUserBalance(telegramId, tokens, bonusTokens, usdt) {
   await pool.query(
@@ -163,7 +182,11 @@ export async function updateUserBalance(telegramId, tokens, bonusTokens, usdt) {
       WHERE telegram_id = $1`,
     [telegramId, tokens, bonusTokens, usdt]
   );
+
+  await redis.del(`userbal:${telegramId}`);
 }
+
+
 
 export async function getTotalUsers() {
   const res = await pool.query(`SELECT COUNT(*) AS total FROM users`);
@@ -426,49 +449,54 @@ export async function saveMatch(match) {
 
 
 export async function getMatches() {
+  const cacheKey = `matches:all`;
+
+  const cached = await redis.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
   const res = await pool.query(`
     SELECT 
-      match_id,
-      name,
-      start_time,
-      start_date,
-      start_time_local,
-      status,
-      score,
-      team1,
-      team2,
-      series_name,
-      match_format,
-      country
+      match_id, name, start_time, start_date, start_time_local,
+      status, score, team1, team2, series_name, match_format, country
     FROM matches
     WHERE match_id IS NOT NULL
     ORDER BY start_date, start_time_local ASC
   `);
-  return res.rows || [];
+
+  const list = res.rows || [];
+
+  await redis.set(cacheKey, JSON.stringify(list), { EX: 5 });
+
+  return list;
 }
+
 
 
 
 
 export async function getMatchById(matchId) {
   const numericId = parseInt(String(matchId).replace(/^m-/, "").trim(), 10);
-  if (isNaN(numericId)) {
-    console.warn(`⚠️ [DB] getMatchById received invalid matchId=${matchId}`);
-    return null;
-  }
+  if (isNaN(numericId)) return null;
 
+  const cacheKey = `match:${numericId}`;
+
+  // Try Redis
+  const cached = await redis.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  // Fallback DB
   const { rows } = await pool.query(
     `SELECT * FROM matches WHERE match_id = $1 LIMIT 1`,
     [numericId]
   );
 
-  if (!rows.length) {
-    console.warn(`⚠️ [DB] No match found for match_id=${numericId}`);
-    return null;
-  }
+  if (!rows.length) return null;
+
+  await redis.set(cacheKey, JSON.stringify(rows[0]), { EX: 5 });
 
   return rows[0];
 }
+
 
 
 // =====================================================
@@ -491,7 +519,7 @@ export async function placeBetWithDebit({
   try {
     await client.query("BEGIN");
 
-    // 1️⃣ Lock user balance for update
+    // 1️⃣ Lock user balance
     const balRes = await client.query(
       `SELECT tokens, bonus_tokens, usdt
          FROM balances
@@ -508,7 +536,7 @@ export async function placeBetWithDebit({
 
     if (stake > tokens + bonus) throw new Error("INSUFFICIENT_FUNDS");
 
-    // 2️⃣ Deduct stake (use bonus first)
+    // 2️⃣ Deduct stake using bonus first
     let remaining = stake;
     const useBonus = Math.min(bonus, remaining);
     bonus -= useBonus;
@@ -522,7 +550,7 @@ export async function placeBetWithDebit({
       [telegramId, tokens, bonus]
     );
 
-    // 3️⃣ Record the bet
+    // 3️⃣ Insert bet
     const betRes = await client.query(
       `INSERT INTO bets
          (telegram_id, match_id, match_name, bet_type, bet_option, stake,
@@ -541,25 +569,29 @@ export async function placeBetWithDebit({
       ]
     );
 
-    // 4️⃣ 🔧 Auto-create or update pool summary
-    // 🧩 Ensure a pool record exists for this match + pool_type
-await client.query(
-  `INSERT INTO pools (matchid, pool_type, status, total_stake, created_at, updated_at)
-   VALUES ($1, INITCAP($2), 'active', $3, NOW(), NOW())
-   ON CONFLICT (matchid, pool_type)
-   DO UPDATE
-     SET total_stake = pools.total_stake + $3,
-         updated_at = NOW()`,
-  [matchId, marketType, stake]
-);
-
+    // 4️⃣ Update pool entry
+    await client.query(
+      `INSERT INTO pools (matchid, pool_type, status, total_stake, created_at, updated_at)
+       VALUES ($1, $2, 'active', $3, NOW(), NOW())
+       ON CONFLICT (matchid, pool_type)
+       DO UPDATE
+            SET total_stake = pools.total_stake + $3,
+                updated_at = NOW()`,
+      [matchId, marketType, stake]
+    );
 
     // 5️⃣ Commit transaction
     await client.query("COMMIT");
 
+    // 6️⃣ Cache invalidation AFTER success
+    await redis.del(`poolinfo:${matchId}:${marketType}`);
+    await redis.del(`poolsummary:${matchId}:${marketType}`);
+    await redis.del(`odds:${matchId}:${marketType}`);
+
     console.log(
       `🎯 [DB] Bet placed: ${telegramId} → ${matchName} (${betOption}, ${stake} G)`
     );
+
     return { bet: betRes.rows[0], balance: { tokens, bonus, usdt } };
   } catch (err) {
     await client.query("ROLLBACK");
@@ -572,6 +604,7 @@ await client.query(
 
 
 
+
 // =====================================================
 // ⚖️ DYNAMIC ODDS + POOL SUMMARY
 // =====================================================
@@ -579,19 +612,26 @@ await client.query(
 // ⚖️ DYNAMIC POOL SUMMARY (Uses unified logic from poolLogic.js)
 // =====================================================
 export async function getPoolSummary(matchId, marketType = "PreMatch") {
+  const key = `poolsummary:${matchId}:${marketType}`;
+
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
   try {
-    // ✅ Use unified pool info to stay consistent everywhere
     const pool = await getPoolInfo(matchId, marketType);
 
-    return {
-      participants: pool.participants,      // distinct telegram_id count
+    const summary = {
+      participants: pool.participants,
       totalStake: pool.totalStake,
       status: pool.status,
       remaining: pool.remaining,
       progressBar: pool.progressBar,
     };
+
+    await redis.set(key, JSON.stringify(summary), { EX: 2 });
+
+    return summary;
   } catch (err) {
-    console.error("❌ [DB] getPoolSummary error:", err.message);
     return {
       participants: 0,
       totalStake: 0,
@@ -601,6 +641,7 @@ export async function getPoolSummary(matchId, marketType = "PreMatch") {
     };
   }
 }
+
 
 // =====================================================
 // ❌ CANCEL USER BET (Transactional)
@@ -620,7 +661,7 @@ export async function cancelUserBet(telegramId, playIndex) {
     await client.query("BEGIN");
     console.log(`🧾 [DB] Starting cancelUserBet for user=${telegramId} | index=${playIndex}`);
 
-    // 1️⃣ Fetch user's bets ordered by most recent
+    // 1️⃣ Fetch bets
     const { rows: bets } = await client.query(
       `SELECT id, match_id, market_type, stake, status 
          FROM bets 
@@ -631,26 +672,21 @@ export async function cancelUserBet(telegramId, playIndex) {
 
     if (!bets.length) {
       await client.query("ROLLBACK");
-      console.warn(`⚠️ [DB] No bets found for ${telegramId}`);
       return { success: false, error: "NO_BETS" };
     }
 
     const bet = bets[playIndex];
     if (!bet) {
       await client.query("ROLLBACK");
-      console.warn(`⚠️ [DB] No bet at index ${playIndex} for ${telegramId}`);
       return { success: false, error: "INVALID_INDEX" };
     }
 
     if (bet.status.toLowerCase() !== "pending") {
       await client.query("ROLLBACK");
-      console.warn(`⚠️ [DB] Bet ${bet.id} is already ${bet.status}`);
       return { success: false, error: "NOT_PENDING" };
     }
 
-    console.log(`🧮 [DB] Found bet ${bet.id} with stake=${bet.stake}`);
-
-    // 2️⃣ Lock balance row
+    // 2️⃣ Lock balance
     const { rows: balances } = await client.query(
       `SELECT tokens, bonus_tokens, usdt 
          FROM balances 
@@ -661,14 +697,13 @@ export async function cancelUserBet(telegramId, playIndex) {
 
     if (!balances.length) {
       await client.query("ROLLBACK");
-      console.warn(`⚠️ [DB] No balance found for ${telegramId}`);
       return { success: false, error: "NO_BALANCE" };
     }
 
     const balance = balances[0];
     const newTokens = Number(balance.tokens) + Number(bet.stake);
 
-    // 3️⃣ Refund and cancel bet
+    // 3️⃣ Refund
     await client.query(
       `UPDATE balances
           SET tokens = $2
@@ -676,6 +711,7 @@ export async function cancelUserBet(telegramId, playIndex) {
       [telegramId, newTokens]
     );
 
+    // 4️⃣ Cancel bet
     const res = await client.query(
       `UPDATE bets
           SET status = 'Cancelled',
@@ -690,7 +726,7 @@ export async function cancelUserBet(telegramId, playIndex) {
       return { success: false, error: "NO_UPDATE" };
     }
 
-    // 4️⃣ Fully recalculate pool total stake from non-cancelled bets
+    // 5️⃣ Recalculate pool stake
     await client.query(
       `
       UPDATE pools p
@@ -708,22 +744,23 @@ export async function cancelUserBet(telegramId, playIndex) {
       [bet.match_id, bet.market_type]
     );
 
-    // 5️⃣ Clear any session-level cache to force fresh odds later
     await client.query("DISCARD ALL");
-
     await client.query("COMMIT");
+
+    // 6️⃣ Now safely invalidate cache AFTER commit
+    await redis.del(`poolinfo:${bet.match_id}:${bet.market_type}`);
+    await redis.del(`poolsummary:${bet.match_id}:${bet.market_type}`);
+    await redis.del(`odds:${bet.match_id}:${bet.market_type}`);
 
     console.log(
       `✅ [DB] Cancelled bet ${bet.id} | refunded=${bet.stake} | newTokens=${newTokens} | pool refreshed`
     );
 
-    // 6️⃣ Trigger odds recalculation asynchronously (non-blocking)
+    // 7️⃣ Trigger odds re-eval
     process.nextTick(async () => {
       try {
         await refreshPoolOdds(bet.match_id, bet.market_type);
-      } catch (err) {
-        console.warn(`⚠️ [OddsRefresh] Failed post-cancel: ${err.message}`);
-      }
+      } catch {}
     });
 
     return {
@@ -735,7 +772,6 @@ export async function cancelUserBet(telegramId, playIndex) {
     };
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error(`❌ [DB] cancelUserBet failed for ${telegramId}:`, err.message);
     return { success: false, error: err.message };
   } finally {
     client.release();
@@ -746,7 +782,7 @@ export async function cancelUserBet(telegramId, playIndex) {
 /**
  * ♻️ Recompute and refresh pool odds after bet cancellation
  */
-async function refreshPoolOdds(matchId, marketType = "PreMatch") {
+export async function refreshPoolOdds(matchId, marketType = "PreMatch") {
   try {
     const res = await pool.query(
       `
@@ -767,6 +803,11 @@ async function refreshPoolOdds(matchId, marketType = "PreMatch") {
       [matchId, marketType]
     );
 
+    // 🧽 Cache invalidation (ALWAYS after DB update)
+    await redis.del(`poolinfo:${matchId}:${marketType}`);
+    await redis.del(`poolsummary:${matchId}:${marketType}`);
+    await redis.del(`odds:${matchId}:${marketType}`);
+
     if (res.rowCount > 0) {
       console.log(`♻️ [DB] Pool odds recalculated for ${matchId} (${marketType})`);
     } else {
@@ -782,12 +823,28 @@ async function refreshPoolOdds(matchId, marketType = "PreMatch") {
 // ⚖️ DYNAMIC ODDS + POOL SUMMARY (Updated for Real Team Names)
 // =====================================================
 export async function getDynamicOdds(matchId, marketType = "PreMatch") {
-  try {
-    const poolInfo = await getPoolInfo(matchId, marketType);
-    const status = poolInfo.status || getPoolStatus(poolInfo.participants);
+  const cacheKey = `odds:${matchId}:${marketType.toLowerCase()}`;
 
-    const { rows: matchRes } = await pool.query(
-      `SELECT api_payload FROM matches WHERE match_id = $1 LIMIT 1`,
+  // 1️⃣ Try Redis (returns parsed JSON automatically)
+  const cached = await poolCache.poolCacheGet(cacheKey);
+  if (cached) {
+    logger.debug(`⚡ [OddsCacheHit] ${cacheKey}`);
+    return cached;            // Already parsed
+  }
+
+  try {
+    // 2️⃣ Get aggregated pool data (comes from poolLogic.js)
+    const poolInfo = await getPoolInfo(matchId, marketType);
+
+    const status =
+      poolInfo.status || getPoolStatus(poolInfo.participants, 10);
+
+    // 3️⃣ Fetch API payload for team names
+    const { rows: matchRes } = await query(
+      `SELECT api_payload 
+         FROM matches 
+        WHERE match_id = $1 
+        LIMIT 1`,
       [matchId]
     );
 
@@ -800,22 +857,45 @@ export async function getDynamicOdds(matchId, marketType = "PreMatch") {
           typeof matchRes[0].api_payload === "object"
             ? matchRes[0].api_payload
             : JSON.parse(matchRes[0].api_payload || "{}");
+
         teamA = payload?.team1?.teamName || teamA;
         teamB = payload?.team2?.teamName || teamB;
-      } catch (err) {
-        console.warn(`⚠️ [DB] getDynamicOdds parse error: ${err.message}`);
+      } catch (e) {
+        logger.warn(`⚠️ [Odds] Payload parse failed for ${matchId}`);
       }
     }
 
-    // (keep the rest of your function same — odds computation logic unchanged)
+    // ────────────────────────────────────────────────
+    // 🧮 Odds Calculation
+    // ────────────────────────────────────────────────
+    const options = poolInfo.rows || [];
+
+    const oddsArray = options.map((row) => {
+      const stakeOnOption = Number(row.total_stake || 0);
+      const totalStake = poolInfo.totalStake || 1;
+
+      // Avoid divide-by-zero
+      const base = Math.max(1.1, totalStake / (stakeOnOption + 1));
+
+      return {
+        bet_option: row.bet_option,
+        stake_on_option: stakeOnOption,
+        odds: Number(base.toFixed(2)),
+      };
+    });
+
+    // 4️⃣ Save to Redis
+    await poolCache.poolCacheSet(cacheKey, oddsArray, 3);
+
+    return oddsArray;
   } catch (err) {
-    console.error("❌ [DB] getDynamicOdds error:", err.message);
+    logger.error(`❌ [getDynamicOdds] Failed: ${err.message}`);
+
+    // 5️⃣ Fail-safe defaults
     return [
       { bet_option: "Team A to Win", odds: 1.00, stake_on_option: 0 },
       { bet_option: "Team B to Win", odds: 1.00, stake_on_option: 0 },
       { bet_option: "Draw / Tie", odds: 1.00, stake_on_option: 0 },
-      { bet_option: "Over 300 Runs", odds: 1.00, stake_on_option: 0 },
-      { bet_option: "Under 300 Runs", odds: 1.00, stake_on_option: 0 },
     ];
   }
 }
@@ -981,26 +1061,31 @@ export async function getUpcomingMatches(limit = 50) {
 // • Includes both 'upcoming' and 'live/in progress' statuses
 // • Ensures non-null team names and numeric match_id for watcher
 // ============================================================
-export async function getNearestMatches(limit = 5) {
+// ============================================================
+// 🏏 getNearestMatches — Active Window Safe (v3.0)
+// ============================================================
+// Purpose:
+// • Returns top N matches closest to now (start_time ASC)
+// • Includes 'upcoming', 'live', 'in progress', 'locked_pre'
+// • Skips completed/cancelled matches
+// ============================================================
+export async function getNearestMatches(limit = 10) {
   try {
     const sql = `
       SELECT 
-        m.match_id,                                 -- ✅ numeric foreign key used across app
-        m.id AS match_uid,                          -- original "m-12345" style ID (for logs)
+        m.match_id,                                 -- numeric key used across app
         COALESCE(m.api_payload->'team1'->>'teamName', m.team1, 'Team A') AS team1,
         COALESCE(m.api_payload->'team2'->>'teamName', m.team2, 'Team B') AS team2,
-        m.status,
+        LOWER(m.status) AS status,
         m.start_time,
         m.series_name,
         m.match_desc,
-        m.api_payload->'venueInfo'->>'ground' AS venue,
-        m.api_payload->>'tossStatus' AS toss_info
+        m.api_payload->'venueInfo'->>'ground' AS venue
       FROM matches m
       WHERE 
         m.match_id IS NOT NULL
-        AND LOWER(m.status) IN (
-          'upcoming', 'scheduled', 'not started', 
-          'live', 'in progress', 'locked_pre'
+        AND LOWER(m.status) NOT IN (
+          'completed', 'finished', 'abandoned', 'cancelled', 'canceled', 'no result'
         )
       ORDER BY m.start_time ASC NULLS LAST
       LIMIT $1;
@@ -1009,15 +1094,14 @@ export async function getNearestMatches(limit = 5) {
     const { rows } = await pool.query(sql, [limit]);
 
     if (rows.length === 0) {
-      console.log("⚠️ [DB] getNearestMatches → No matches found.");
+      console.log("⚠️ [DB] getNearestMatches → No active matches found.");
     } else {
-      console.log(`📋 [DB] getNearestMatches → ${rows.length} matches fetched.`);
+      console.log(`📋 [DB] getNearestMatches → Loaded ${rows.length} matches.`);
       rows.forEach((m) => {
-        const label = `[m-${m.match_id}] ${m.team1} vs ${m.team2}`;
         const time = m.start_time
           ? new Date(m.start_time).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
           : "TBA";
-        console.log(`🕓 ${label} | ${m.status} | ${time}`);
+        console.log(`🕓 [m-${m.match_id}] ${m.team1} vs ${m.team2} | ${m.status} | ${time}`);
       });
     }
 
@@ -1028,6 +1112,30 @@ export async function getNearestMatches(limit = 5) {
   }
 }
 
+
+// ============================================================
+// 🏁 isAnyMatchCompleted — Check if any given match_id is completed
+// ============================================================
+export async function isAnyMatchCompleted(matchIds = []) {
+  if (!matchIds.length) return false;
+
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT COUNT(*) AS completed_count
+        FROM matches
+       WHERE match_id = ANY($1)
+         AND LOWER(status) = 'completed'
+      `,
+      [matchIds]
+    );
+    const count = Number(rows[0]?.completed_count || 0);
+    return count > 0;
+  } catch (err) {
+    console.error("❌ [DB] isAnyMatchCompleted error:", err.message);
+    return false;
+  }
+}
 
 
 
@@ -1320,6 +1428,28 @@ export async function markMatchesAsLive() {
     console.error("❌ [DB] markMatchesAsLive error:", err.message);
   }
 }
+
+// ============================================================
+// ⚡ markDueMatchesLive — promote matches to LIVE if start_time passed
+// ============================================================
+export async function markDueMatchesLive() {
+  try {
+    const res = await pool.query(`
+      UPDATE matches
+         SET status = 'live',
+             updated_at = NOW()
+       WHERE start_time <= NOW()
+         AND LOWER(status) IN ('upcoming', 'scheduled', 'not started', 'locked_pre')
+    `);
+
+    if (res.rowCount > 0) {
+      console.log(`⚡ [DB] Promoted ${res.rowCount} matches → LIVE`);
+    }
+  } catch (err) {
+    console.error("❌ [DB] markDueMatchesLive error:", err.message);
+  }
+}
+
 
 // =====================================================
 // 🏁 FETCH COMPLETED MATCH IDS (to avoid re-saving them)

@@ -1,14 +1,10 @@
-// src/bot/handlers/startHandler.js
-
-
 // =====================================================
-// 🚀 START HANDLER — Auto Register New Users + Show Menu (v3.7 Stable Markdown-Safe)
+// 🚀 START HANDLER — Auto Register New Users + Show Menu (v3.9 HTML-Stable)
 // =====================================================
 import { Markup } from "telegraf";
 import { logger } from "../../utils/logger.js";
 import { DateTime } from "luxon";
 import { getUserById, createOrUpdateUser } from "../../db/db.js";
-import { safeMarkdown } from "../../utils/markdown.js";
 
 /* ============================================================
  💬 Greeting Based on Time (IST)
@@ -44,9 +40,9 @@ function showPlayNowButton(ctx) {
     [Markup.button.callback("🎯 Play Now", "start_menu")],
   ]);
   return ctx.reply(
-  "👋 Welcome back! Tap below to reopen the CricPredict menu:",
-  { parse_mode: "MarkdownV2" } // wrapper will safely escape it since no __escaped flag
-);
+    "👋 Welcome back! Tap below to reopen the CricPredict menu:",
+    { reply_markup: btn.reply_markup }
+  );
 }
 
 /* ============================================================
@@ -72,39 +68,33 @@ export default function startHandler(bot) {
         logger.info(`👋 [Start] Registered new user ${userId} (${username || "N/A"})`);
       }
 
-      // 2️⃣ Prepare welcome text
+      // 2️⃣ Prepare welcome text (HTML-safe)
       const greeting = getGreeting();
-      const name = safeMarkdown(firstName || "Player");
+      const name = firstName || "Player";
 
-      // Escape all parentheses and dashes manually before applying safeMarkdown
-      const rawWelcome =
-        `🏏 *Welcome to CricPredict*, ${name}!\n\n` +
-        `${greeting}! 👋\n\n` +
-        `CricPredict lets you:\n` +
-        `• 🎯 Predict match outcomes \\(Pre-match & Live\\)\n` +
-        `• 💰 Earn G-Tokens and win TRC\\-20 USDT\n` +
-        `• 🏆 Track your rewards and rankings\n\n` +
-        `Choose an option below 👇`;
+      const welcomeMessage = `
+<b>🏏 Welcome to CricPredict</b>, ${name}!  
+${greeting}! 👋  
 
-      // Use safeMarkdown once at the end to sanitize any other special chars
-      const welcomeMessage = rawWelcome; // already manually escaped where needed
-await ctx.reply(welcomeMessage, {
-  parse_mode: "MarkdownV2",
-  __escaped: true,
-  reply_markup: mainMenu().reply_markup,
-}).catch(async (err) => {
-        logger.warn(`⚠️ [StartHandler] Markdown parse issue: ${err.message}`);
-        await ctx.reply(rawWelcome); // fallback plain text
+CricPredict lets you:  
+• 🎯 Predict match outcomes (Pre-match & Live)  
+• 💰 Earn G-Tokens and win TRC-20 USDT  
+• 🏆 Track your rewards and rankings  
+
+<b>Choose an option below 👇</b>
+      `;
+
+      // Send via Telegram API to ensure HTML rendering
+      await ctx.telegram.sendMessage(ctx.chat.id, welcomeMessage, {
+        parse_mode: "HTML",
+        reply_markup: mainMenu().reply_markup,
       });
 
       logger.info(`📨 [Start] Sent welcome menu to user=${userId}`);
     } catch (err) {
       logger.error(`❌ [StartHandler] ${err.message}`);
       await ctx.reply(
-        safeMarkdown(
-          "⚠️ Something went wrong while initializing your account. Please try again later."
-        ),
-        { parse_mode: "MarkdownV2" }
+        "⚠️ Something went wrong while initializing your account. Please try again later."
       );
     }
   };
@@ -124,21 +114,21 @@ await ctx.reply(welcomeMessage, {
       await ctx.answerCbQuery();
     } catch {}
 
-    const text =
-  `🏏 *Welcome back*, ${safeMarkdown(first)}!\n\n` +
-  `${greeting}, ready to make your next move 👇`;
-
+    const text = `
+<b>🏏 Welcome back</b>, ${first}!  
+${greeting}, ready to make your next move 👇
+    `;
 
     try {
       await ctx.editMessageText(text, {
-        parse_mode: "MarkdownV2",
+        parse_mode: "HTML",
         reply_markup: mainMenu().reply_markup,
       });
       logger.info(`✅ [MainMenu] Updated for user=${userId}`);
     } catch (err) {
       if (!err.description?.includes("message is not modified")) {
         await ctx.reply(text, {
-          parse_mode: "MarkdownV2",
+          parse_mode: "HTML",
           reply_markup: mainMenu().reply_markup,
         });
       }

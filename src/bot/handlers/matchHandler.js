@@ -1,9 +1,25 @@
 // ============================================================
-// 🏏 Match Handler (v4.0 — HTML Mode, Clean Output & Predict Buttons)
+// 🏏 Match Handler (v5.0 — Redis Cached + Rate Limited)
 // ============================================================
+//
+// • Uses Redis matchCache.js
+// • Fast match list retrieval
+// • Rate limits: matches, refresh, predict_<id>
+// • Treats locked_pre as LIVE
+// • Skips Test matches
+// ============================================================
+
 import { Markup } from "telegraf";
 import { DateTime } from "luxon";
-import { getMatches, getMatchById } from "../../db/db.js";
+
+// ✔ Correct imports (from your updated matchCache.js)
+import {
+  getMatchesCached,
+  getMatchCachedById,
+  invalidateMatchCache
+} from "../../redis/matchCache.js";
+
+import { rateLimit } from "../../redis/rateLimit.js";
 import { startPreMatchBet } from "./preMatchBetHandler.js";
 import { logger } from "../../utils/logger.js";
 
@@ -11,9 +27,13 @@ import { logger } from "../../utils/logger.js";
 function formatStartTimeFromUTC(match, zone = "Asia/Kolkata") {
   try {
     if (!match?.start_time) return "TBA";
-    const iso = typeof match.start_time === "string"
-      ? match.start_time.replace(" ", "T") + (match.start_time.includes("Z") ? "" : "Z")
-      : match.start_time.toISOString();
+
+    const iso =
+      typeof match.start_time === "string"
+        ? match.start_time.replace(" ", "T") +
+          (match.start_time.includes("Z") ? "" : "Z")
+        : match.start_time.toISOString();
+
     const dt = DateTime.fromISO(iso, { zone: "utc" });
     return dt.isValid ? dt.setZone(zone).toFormat("dd LLL yyyy, hh:mm a") : "Invalid";
   } catch {
@@ -21,38 +41,70 @@ function formatStartTimeFromUTC(match, zone = "Asia/Kolkata") {
   }
 }
 
-/* ---------- User Timezone ---------- */
+/* ---------- Determine User Timezone ---------- */
 function getUserTimeZone(ctx) {
   const lang = ctx.from?.language_code?.toLowerCase() || "en";
   const zones = {
-    en: "Asia/Kolkata", hi: "Asia/Kolkata",
-    en_us: "America/New_York", en_gb: "Europe/London",
-    ar: "Asia/Dubai", ru: "Europe/Moscow",
-    id: "Asia/Jakarta", nl: "Europe/Amsterdam",
+    en: "Asia/Kolkata",
+    hi: "Asia/Kolkata",
+    en_us: "America/New_York",
+    en_gb: "Europe/London",
+    ar: "Asia/Dubai",
+    ru: "Europe/Moscow",
+    id: "Asia/Jakarta",
+    nl: "Europe/Amsterdam",
   };
   return zones[lang] || "Asia/Kolkata";
 }
 
 /* ---------- Escape HTML ---------- */
-function html(text = "") {
-  return String(text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+function html(t = "") {
+  return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/* ---------- Main Handler ---------- */
+/* ---------- Unified LIVE Condition ---------- */
+function isLiveStatus(status = "") {
+  return /(live|playing|in progress|locked_pre)/.test(status.toLowerCase());
+}
+
+/* ============================================================
+ 🎯 Main Match Handler
+============================================================ */
 export default function matchHandler(bot) {
+
+  // -----------------------------------------------------------
+  // 📌 OPEN MATCH LIST — "matches"
+  // -----------------------------------------------------------
   bot.action("matches", async (ctx) => {
-    try { await ctx.answerCbQuery("Loading matches..."); } catch {}
+    const user = ctx.from.id;
+
+    const allowed = await rateLimit(`matches_open:${user}`, 3, 3);
+    if (!allowed)
+      return ctx.answerCbQuery("⏳ Slow down…");
+
+    try { await ctx.answerCbQuery("Loading..."); } catch {}
     await showMatches(ctx);
   });
 
+  // -----------------------------------------------------------
+  // 🔄 REFRESH MATCH LIST — "matches_refresh"
+  // -----------------------------------------------------------
   bot.action("matches_refresh", async (ctx) => {
+    const user = ctx.from.id;
+
+    const allowed = await rateLimit(`matches_refresh:${user}`, 3, 4);
+    if (!allowed)
+      return ctx.answerCbQuery("⏳ Too fast…");
+
     try { await ctx.answerCbQuery("Refreshing..."); } catch {}
+
+    await invalidateMatchCache(); // ✔ ONLY PLACE where invalidation should happen
     await showMatches(ctx);
   });
 
+  // -----------------------------------------------------------
+  // ⛔ Disabled Buttons
+  // -----------------------------------------------------------
   bot.action("disabled_live", (ctx) =>
     ctx.answerCbQuery("🔒 Live predictions open after toss.")
   );
@@ -60,31 +112,47 @@ export default function matchHandler(bot) {
     ctx.answerCbQuery("🔒 Pre-match predictions closed.")
   );
 
-  /* ---------- Predict Now ---------- */
+  // -----------------------------------------------------------
+  // 🎯 PREDICT NOW — "predict_<matchId>"
+  // -----------------------------------------------------------
   bot.action(/^predict_(.+)/, async (ctx) => {
+    const user = ctx.from.id;
+
+    const allowed = await rateLimit(`predict:${user}`, 5, 5);
+    if (!allowed)
+      return ctx.answerCbQuery("⏳ Hold on…");
+
     await ctx.answerCbQuery();
+
     const matchId = ctx.match[1];
-    const match = await getMatchById(matchId);
+
+    // ⭐ Correct Redis call
+    const match = await getMatchCachedById(matchId);
+
     if (!match) return ctx.reply("❌ Match not found.");
 
     const zone = getUserTimeZone(ctx);
-    const live = /(live|playing|in progress|locked_pre)/.test(
-      (match.status || "").toLowerCase()
-    );
+    const live = isLiveStatus(match.status);
 
     let tossText = "🕓 <b>Toss:</b> Not yet done";
+
     try {
-      const p =
+      const payload =
         typeof match.api_payload === "object"
           ? match.api_payload
           : JSON.parse(match.api_payload || "{}");
-      const w = p?.tossResults?.tossWinnerName || p?.tossWinnerName;
-      const d = p?.tossResults?.decision || p?.tossDecision;
-      if (w && d) tossText = `🪙 <b>Toss:</b> ${html(`${w} won the toss and chose to ${d} first`)}`;
+
+      const w = payload?.tossResults?.tossWinnerName || payload?.tossWinnerName;
+      const d = payload?.tossResults?.decision || payload?.tossDecision;
+
+      if (w && d)
+        tossText = `🪙 <b>Toss:</b> ${html(`${w} won the toss and chose to ${d} first`)}`;
     } catch {}
 
     const info = `
 <b>${live ? "🔴 LIVE" : "🕓 UPCOMING"}</b> | <b>${html(match.name)}</b>
+🏆 <b>${html(match.series_name || "Unknown Series")}</b>
+📘 <b>Format:</b> ${html(match.match_format || "TBD")}
 📅 <b>${html(formatStartTimeFromUTC(match, zone))}</b>
 ${tossText}
 📍 <b>Status:</b> ${html(match.status || "TBD")}
@@ -92,13 +160,17 @@ ${tossText}
 
     const buttons = live
       ? [
-          [Markup.button.callback("⚫ Pre-Match (Locked)", "disabled_pre"),
-           Markup.button.callback("🔴 Live Prediction", `live_${match.match_id}`)],
+          [
+            Markup.button.callback("⚫ Pre-Match (Locked)", "disabled_pre"),
+            Markup.button.callback("🔴 Live Prediction", `live_${match.match_id}`)
+          ],
           [Markup.button.callback("🔙 Back to Matches", "matches")],
         ]
       : [
-          [Markup.button.callback("🎯 Pre-Match Prediction", `prematch_${match.match_id}`),
-           Markup.button.callback("⚫ Live (Locked)", "disabled_live")],
+          [
+            Markup.button.callback("🎯 Pre-Match Prediction", `prematch_${match.match_id}`),
+            Markup.button.callback("⚫ Live (Locked)", "disabled_live")
+          ],
           [Markup.button.callback("🔙 Back to Matches", "matches")],
         ];
 
@@ -108,9 +180,12 @@ ${tossText}
     });
   });
 
-  /* ---------- Pre-Match ---------- */
+  // -----------------------------------------------------------
+  // 🎯 PRE-MATCH BET
+  // -----------------------------------------------------------
   bot.action(/^prematch_(.+)/, async (ctx) => {
     await ctx.answerCbQuery();
+
     try {
       await startPreMatchBet(ctx, ctx.match[1]);
     } catch (err) {
@@ -120,20 +195,34 @@ ${tossText}
   });
 }
 
-/* ---------- Show Matches ---------- */
+/* ============================================================
+ 📅 SHOW MATCHES (Uses Redis cache)
+============================================================ */
 async function showMatches(ctx) {
-  const all = await getMatches();
+
+  // ⭐ Fetch from Redis (NO CALLBACK)
+  const all = await getMatchesCached();
+
   if (!all?.length)
     return ctx.reply("📭 No live or upcoming matches right now.");
 
   const filtered = all
-    .filter((m) =>
-      ["live", "playing", "in progress", "upcoming", "scheduled", "locked_pre"].some((x) =>
-        (m.status || "").toLowerCase().includes(x)
-      )
-    )
+    .filter((m) => {
+      const status = (m.status || "").toLowerCase();
+      const format = (m.match_format || "").toLowerCase();
+
+      const activeStatuses = [
+        "live", "playing", "in progress",
+        "upcoming", "scheduled", "locked_pre"
+      ];
+
+      return activeStatuses.some((x) => status.includes(x)) && !format.includes("test");
+    })
     .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
     .slice(0, 5);
+
+  if (!filtered.length)
+    return ctx.reply("🧪 Only Test matches are active. Predictions reopen soon!");
 
   const zone = getUserTimeZone(ctx);
   const now = DateTime.now().setZone(zone);
@@ -143,31 +232,34 @@ async function showMatches(ctx) {
   });
 
   for (const m of filtered) {
-    const live = /(live|playing|in progress|locked_pre)/.test(
-      (m.status || "").toLowerCase()
-    );
+    const live = isLiveStatus(m.status);
     const prefix = live ? "🔴 LIVE" : "🕓 UPCOMING";
     const when = formatStartTimeFromUTC(m, zone);
 
-    // Countdown
     let countdown = "⏳ <b>Start time:</b> Unknown";
+
     try {
-      const dt = DateTime.fromISO(String(m.start_time).replace(" ", "T"), { zone: "utc" }).setZone(zone);
+      const dt = DateTime.fromISO(String(m.start_time).replace(" ", "T"), {
+        zone: "utc",
+      }).setZone(zone);
+
       const diff = dt.diff(now, ["hours", "minutes"]);
       if (diff.as("minutes") > 0) {
         const h = Math.floor(diff.hours);
         const mLeft = Math.floor(diff.minutes % 60);
         countdown = `⏳ <b>Starts in:</b> ${h > 0 ? `${h}h ` : ""}${mLeft}m`;
-      } else countdown = "🪙 <b>Toss likely completed</b>";
+      } else {
+        countdown = "🪙 <b>Toss likely completed</b>";
+      }
     } catch {}
 
     const msg = `
 <b>${prefix}</b> | <b>${html(m.name)}</b>
-🏆 <b>${html(m.series_name || "Unknown Series")} (${html(m.match_format || "TBD")})</b>
+🏆 <b>${html(m.series_name || "Unknown Series")}</b>
+📘 <b>Format:</b> ${html(m.match_format || "TBD")}
 📅 <b>${html(when)}</b>
 ${countdown}
 🏟️ ${m.venue ? html(m.venue) + (m.city ? `, ${html(m.city)}` : "") : "Venue TBA"}
-🌍 <b>Country:</b> ${html(m.country || "Unknown")}
 📍 <b>Status:</b> ${html(m.status?.toUpperCase() || "TBD")}
 `.trim();
 
@@ -191,7 +283,8 @@ ${countdown}
     reply_markup: footer.reply_markup,
   });
 
-  await ctx.reply(`📡 <b>Last Updated:</b> ${html(now.toFormat("dd LLL yyyy, hh:mm a"))}`, {
-    parse_mode: "HTML",
-  });
+  await ctx.reply(
+    `📡 <b>Last Updated:</b> ${html(now.toFormat("dd LLL yyyy, hh:mm a"))}`,
+    { parse_mode: "HTML" }
+  );
 }

@@ -1,78 +1,76 @@
 // =============================================================
-// 🪙 Generate Master Wallet + Sample User Deposit Addresses
+// ⚡ Deterministic Deposit Address Manager (Option 2)
 // =============================================================
-import TronWebImport from "tronweb";
-import { generateMnemonic, mnemonicToSeedSync } from "@scure/bip39";
-import { wordlist } from "@scure/bip39/wordlists/english.js";
-import { HDKey } from "@scure/bip32";
-import crypto from "crypto";
+import { Pool } from "pg";
+import dotenv from "dotenv";
+import { logger } from "./logger.js";
+import { deriveAddressForIndex } from "./wallet.js";
 
-// 🧩 Detect export style automatically (ESM vs CommonJS)
-const TronWeb = TronWebImport?.default?.TronWeb
-  || TronWebImport?.TronWeb
-  || TronWebImport?.default
-  || TronWebImport;
+dotenv.config();
 
-// 🧠 Detect if it’s a class or a static object
-let tronWeb;
-try {
-  tronWeb = new TronWeb({
-    fullHost: "https://api.shasta.trongrid.io",
-  });
-} catch {
-  tronWeb = TronWeb; // fallback for static builds
+const pool = new Pool({
+  user: process.env.PGUSER,
+  host: process.env.PGHOST,
+  database: process.env.PGDATABASE,
+  password: process.env.PGPASSWORD,
+  port: process.env.PGPORT,
+});
+
+/**
+ * Get or create a deterministic TRON deposit address for a user.
+ * No private keys are stored anywhere.
+ */
+export async function getOrCreateDepositAddress(telegramId) {
+  const client = await pool.connect();
+
+  try {
+    // 0️⃣ Ensure the derivation index tracker table exists
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS wallet_sequence (
+        id SERIAL PRIMARY KEY
+      );
+    `);
+
+    // 1️⃣ Check if user already has a deposit address
+    const { rows: existing } = await client.query(
+      `SELECT deposit_address, derivation_index FROM users WHERE telegram_id = $1`,
+      [telegramId]
+    );
+
+    if (existing.length) {
+      const row = existing[0];
+      return { address: row.deposit_address, derivationIndex: row.derivation_index };
+    }
+
+    // 2️⃣ Allocate new derivation index atomically
+    const { rows: seqRows } = await client.query(`
+      INSERT INTO wallet_sequence DEFAULT VALUES
+      RETURNING id AS next_index;
+    `);
+    const index = seqRows[0].next_index;
+
+    // 3️⃣ Derive address deterministically from master mnemonic
+    const { address, path } = deriveAddressForIndex(index);
+
+    // 4️⃣ Save to users table (no private key storage)
+    await client.query(
+      `UPDATE users
+          SET deposit_address = $1, derivation_index = $2
+        WHERE telegram_id = $3`,
+      [address, index, telegramId]
+    );
+
+    logger.info(
+      `🆕 [DepositAddress] Created TRON address for user=${telegramId}, index=${index}, path=${path}, address=${address}`
+    );
+
+    return { address, derivationIndex: index };
+  } catch (err) {
+    logger.error(`❌ [DepositAddress] ${err.message}`);
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-console.log("===============================================");
-console.log("🚀 Generating New Master TRON Wallet...");
-console.log("===============================================");
-
-// 1️⃣ Generate a new mnemonic (BIP39)
-const mnemonic = generateMnemonic(wordlist);
-console.log("\n🔑 MASTER MNEMONIC (store securely!):\n", mnemonic);
-
-// 2️⃣ Derive seed + root
-const seed = mnemonicToSeedSync(mnemonic);
-const root = HDKey.fromMasterSeed(seed);
-
-// 3️⃣ Derive the master path for TRON (BIP44, coin type 195)
-const masterPath = "m/44'/195'/0'/0/0";
-const masterNode = root.derive(masterPath);
-
-// 4️⃣ Get the master private key and address
-const masterPriv = Buffer.from(masterNode.privateKey).toString("hex");
-
-// If tronWeb is a static object (non-instantiable), use static call:
-const masterAddress =
-  typeof tronWeb?.address?.fromPrivateKey === "function"
-    ? tronWeb.address.fromPrivateKey(masterPriv)
-    : TronWeb.address.fromPrivateKey(masterPriv);
-
-console.log("\n🏦 MASTER WALLET DETAILS:");
-console.log("→ Derivation Path:", masterPath);
-console.log("→ Master Address:", masterAddress);
-console.log("→ Master Private Key:", masterPriv);
-
-// 5️⃣ Optional: Generate AES-256 encryption key for your .env vault
-const aesKey = crypto.randomBytes(32);
-const aesKeyBase64 = aesKey.toString("base64");
-console.log("\n🧬 MASTER_ENCRYPTION_KEY (store in .env):", aesKeyBase64);
-
-// 6️⃣ Example: derive first 3 deterministic user deposit addresses
-console.log("\n📦 SAMPLE USER DEPOSIT ADDRESSES:");
-for (let i = 0; i < 3; i++) {
-  const userPath = `m/44'/195'/0'/0/${i}`;
-  const userNode = root.derive(userPath);
-  const userPriv = Buffer.from(userNode.privateKey).toString("hex");
-  const userAddress =
-    typeof tronWeb?.address?.fromPrivateKey === "function"
-      ? tronWeb.address.fromPrivateKey(userPriv)
-      : TronWeb.address.fromPrivateKey(userPriv);
-
-  console.log(`\nUser #${i}`);
-  console.log(`Path: ${userPath}`);
-  console.log(`Address: ${userAddress}`);
-  console.log(`Private Key: ${userPriv}`);
-}
-
-console.log("\n✅ Done! Save your MASTER_MNEMONIC & AES KEY in .env securely.");
+export default getOrCreateDepositAddress;

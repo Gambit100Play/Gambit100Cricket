@@ -1,13 +1,14 @@
+// src/api/fetchAllMatches.js
+
 // ============================================================
-// 🏏 Unified Match Fetcher — Upcoming + Live Upsert (v4.0)
+// 🏏 Unified Match Fetcher — Upcoming + Live Upsert (v4.1)
 // ============================================================
 //
-// Purpose:
-// • Fetches both upcoming and live matches via Cricbuzz RapidAPI
-// • Merges both result sets into one uniform structure
-// • Upserts into DB safely with cooldown + lock + retry
-//
-// Author: Artham Bhardwaj
+// Rules:
+// • Store only live matches from TODAY (start time <= now, status=live)
+// • Store only upcoming matches TODAY or FUTURE
+// • Exclude all TEST matches
+// • Exclude all old matches (yesterday or older)
 // ============================================================
 
 import { pool } from "../db/db.js";
@@ -179,13 +180,66 @@ export async function ensureAllMatches() {
 
       for (const m of matches) {
         try {
+          // ------------------------------------------------------------
+          // ❌ 0) Skip Test matches
+          // ------------------------------------------------------------
+          if (String(m.match_format).toLowerCase().includes("test")) {
+            logger.info(`⏭️ Excluded TEST match ${m.match_id}`);
+            continue;
+          }
+
+          // ------------------------------------------------------------
+          // 1) Normalize start time
+          // ------------------------------------------------------------
+          const startDT = toSafeUTC(
+            m.start_date || m.startTime || m.startDate
+          );
+          const nowIST = DateTime.now().setZone("Asia/Kolkata");
+          const startIST = startDT.setZone("Asia/Kolkata");
+
+          const today = nowIST.toISODate();
+          const matchDate = startIST.toISODate();
+
+          const hasStarted = startIST <= nowIST;
+          const isLiveAPI = (m.status ?? "").toLowerCase() === "live";
+          const isTodayMatch = matchDate === today;
+          const isFutureMatch = startIST > nowIST;
+
+          // ------------------------------------------------------------
+          // 2) Filtering rules
+          // ------------------------------------------------------------
+          let shouldStore = false;
+
+          // LIVE matches today
+          if (isLiveAPI && hasStarted && isTodayMatch) {
+            shouldStore = true;
+          }
+
+          // UPCOMING matches today or future
+          if (!isLiveAPI && (isTodayMatch || isFutureMatch)) {
+            shouldStore = true;
+          }
+
+          if (!shouldStore) {
+            logger.info(
+              `⏭️ Skipped ${m.match_id}: ${m.team1} vs ${m.team2} — not live today or upcoming`
+            );
+            continue;
+          }
+
+          // ------------------------------------------------------------
+          // 3) Build fields
+          // ------------------------------------------------------------
           const id = `m-${m.match_id}`;
           const name = `${m.team1 ?? "TBD"} vs ${m.team2 ?? "TBD"}`;
-          const startDT = toSafeUTC(m.start_date || m.startTime || m.startDate);
+
           const endDT = m.end_date
             ? toSafeUTC(m.end_date)
             : startDT.plus({ hours: 4 });
 
+          // ------------------------------------------------------------
+          // 4) Insert / Update
+          // ------------------------------------------------------------
           const res = await client.query(q, [
             id,
             name,
@@ -196,7 +250,7 @@ export async function ensureAllMatches() {
             m.match_format ?? "",
             startDT.toISO(),
             startDT.toISODate(),
-            startDT.setZone("Asia/Kolkata").toFormat("HH:mm:ss"),
+            startIST.toFormat("HH:mm:ss"),
             endDT.toISO(),
             m.team1 ?? "TBD",
             m.team2 ?? "TBD",
@@ -211,7 +265,9 @@ export async function ensureAllMatches() {
           if (res.rowCount > 0) inserted++;
           else updated++;
         } catch (e) {
-          logger.error(`❌ [FetchAll] Insert failed ${m.match_id}: ${e.message}`);
+          logger.error(
+            `❌ [FetchAll] Insert failed for ${m.match_id}: ${e.message}`
+          );
         }
       }
 
@@ -238,7 +294,7 @@ export async function ensureAllMatches() {
 }
 
 // ============================================================
-// 👟 CLI entry (manual testing)
+// 👟 CLI entry
 // ============================================================
 const currentFile = url.fileURLToPath(import.meta.url);
 if (path.resolve(currentFile) === path.resolve(process.argv[1])) {
