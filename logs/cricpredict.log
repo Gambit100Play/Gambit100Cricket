@@ -43704,3 +43704,6 @@ ReferenceError: connectWalletHandler is not defined
   }
 }
 [16 Nov 2025, 12:00:13 AM] [WARN] ⚠️ Received SIGINT. Stopping bot gracefully...
+[18 Nov 2025, 11:18:58 AM] [INFO] 🌐 Tron network initialized → Shasta Testnet
+[18 Nov 2025, 11:18:59 AM] [INFO] 🌐 Tron network initialized → Shasta Testnet
+[18 Nov 2025, 11:18:59 AM] [INFO] ✅ Master mnemonic validated successfully.
